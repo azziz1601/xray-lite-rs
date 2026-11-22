@@ -105,6 +105,17 @@ fn print_help() {
 }
 
 fn main() -> ExitCode {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("api") {
+        return match xray_lite_rs::api_client::run_api_cli(&raw_args[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let cli = match parse_cli() {
         Ok(c) => c,
         Err(e) => {

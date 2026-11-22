@@ -81,7 +81,7 @@ pub async fn handle_vless(
         CMD_TCP => {
             let mut outbound = dial_tcp(&target, runtime.block_private).await?;
             stream.write_all(&[VLESS_VERSION, 0x00]).await?;
-            relay_tcp_with_stats(&mut stream, &mut outbound, counters).await
+            relay_tcp_with_stats(&mut stream, &mut outbound, counters, runtime.block_bittorrent).await
         }
         CMD_UDP => {
             let remote_addr = resolve_udp_target(&target, runtime.block_private).await?;

@@ -1,4 +1,5 @@
 pub mod address;
+pub mod api_client;
 pub mod config;
 pub mod logger;
 pub mod outbound;
@@ -26,7 +27,7 @@ use crate::config::{
 use crate::outbound::configure_tcp_socket;
 use crate::protocol::{handle_stream, InboundProtocol, InboundRuntime, InboundUsers};
 use crate::proxy_protocol::consume_proxy_protocol;
-use crate::stats::{serve_stats_api_connection, AccessLogger, StatsRegistry};
+use crate::stats::{serve_stats_api_connection, AccessLogger, DynamicBlocklist, StatsRegistry};
 use crate::transport::grpc::serve_grpc_connection;
 use crate::transport::httpupgrade::accept_httpupgrade;
 use crate::transport::websocket::accept_websocket;
@@ -163,7 +164,14 @@ pub async fn run_server_with_limit(
     max_connections: usize,
 ) -> Result<(), String> {
     let block_private = cfg.block_private_ips();
+    let block_bittorrent = cfg.block_bittorrent();
     let stats_registry = StatsRegistry::new();
+    let blocklist = DynamicBlocklist::new();
+    if let Some(err_path) = cfg.error_log_path() {
+        if let Err(e) = crate::logger::set_error_file(err_path) {
+            log_warn!("{} (continuing with stderr only)", e);
+        }
+    }
     let access_log = match cfg.access_log_path() {
         Some(path) => match AccessLogger::open(path) {
             Ok(logger) => {
@@ -199,12 +207,13 @@ pub async fn run_server_with_limit(
             let listener = bind_tcp_listener(addr)
                 .map_err(|e| format!("failed to bind StatsService API '{addr}': {e}"))?;
             log_info!(
-                "[{}] listening on {} (gRPC StatsService API)",
+                "[{}] listening on {} (gRPC StatsService + RoutingService API)",
                 key,
                 listener.local_addr().unwrap_or(addr)
             );
             let mut task_shutdown = shutdown_rx.clone();
             let stats = stats_registry.clone();
+            let bl = blocklist.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let accept_res = tokio::select! {
@@ -216,8 +225,9 @@ pub async fn run_server_with_limit(
                         Ok((stream, _peer)) => {
                             configure_tcp_socket(&stream);
                             let st = stats.clone();
+                            let bl = bl.clone();
                             tokio::spawn(async move {
-                                let _ = serve_stats_api_connection(stream, st).await;
+                                let _ = serve_stats_api_connection(stream, st, bl).await;
                             });
                         }
                         Err(e) => {
@@ -249,6 +259,7 @@ pub async fn run_server_with_limit(
         let runtime = Arc::new(InboundRuntime::from_config(
             inbound,
             block_private,
+            block_bittorrent,
             stats_registry.clone(),
             access_log.clone(),
         )?);
@@ -283,6 +294,7 @@ pub async fn run_server_with_limit(
                 );
                 let mut task_shutdown = shutdown_rx.clone();
                 let slots = Arc::clone(&conn_slots);
+                let bl = blocklist.clone();
                 let task = tokio::spawn(async move {
                     loop {
                         let accept_res = tokio::select! {
@@ -295,6 +307,7 @@ pub async fn run_server_with_limit(
                                 Ok(permit) => {
                                     let rt = Arc::clone(&runtime);
                                     let tr = Arc::clone(&transport);
+                                    let bl = bl.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit;
                                         handle_raw_connection(
@@ -302,6 +315,7 @@ pub async fn run_server_with_limit(
                                             "unix".to_string(),
                                             rt,
                                             tr,
+                                            bl,
                                         )
                                         .await;
                                     });
@@ -359,6 +373,7 @@ pub async fn run_server_with_limit(
 
             let mut task_shutdown = shutdown_rx.clone();
             let slots = Arc::clone(&conn_slots);
+            let bl = blocklist.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let accept_res = tokio::select! {
@@ -372,6 +387,7 @@ pub async fn run_server_with_limit(
                                 configure_tcp_socket(&stream);
                                 let rt = Arc::clone(&runtime);
                                 let tr = Arc::clone(&transport);
+                                let bl = bl.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     handle_raw_connection(
@@ -379,6 +395,7 @@ pub async fn run_server_with_limit(
                                         peer.to_string(),
                                         rt,
                                         tr,
+                                        bl,
                                     )
                                     .await;
                                 });
@@ -419,7 +436,12 @@ async fn handle_raw_connection(
     mut peer_desc: String,
     runtime: Arc<InboundRuntime>,
     transport: Arc<TransportConfig>,
+    blocklist: DynamicBlocklist,
 ) {
+    if blocklist.is_blocked(&runtime.tag, &peer_desc) {
+        log_debug!("[{}] ({}): rejected by dynamic source IP block", runtime.tag, peer_desc);
+        return;
+    }
     // 1. Optional HAProxy/Nginx PROXY protocol v1/v2 (with 5s timeout).
     if transport.accept_proxy_protocol {
         match tokio::time::timeout(Duration::from_secs(5), consume_proxy_protocol(stream)).await {
@@ -460,12 +482,20 @@ async fn handle_raw_connection(
     // 3. Transport layer dispatch.
     match transport.network.as_str() {
         "tcp" | "raw" => {
+            if blocklist.is_blocked(&runtime.tag, &peer_desc) {
+                log_debug!("[{}] ({}): rejected by dynamic source IP block", runtime.tag, peer_desc);
+                return;
+            }
             handle_stream(stream, runtime, peer_desc).await;
         }
         "ws" | "websocket" => match accept_websocket(stream, &transport.ws).await {
             Ok((ws_stream, forwarded_ip)) => {
                 if let Some(ip) = forwarded_ip {
                     peer_desc = ip;
+                }
+                if blocklist.is_blocked(&runtime.tag, &peer_desc) {
+                    log_debug!("[{}] ({}): rejected by dynamic source IP block", runtime.tag, peer_desc);
+                    return;
                 }
                 handle_stream(Box::new(ws_stream), runtime, peer_desc).await;
             }
@@ -477,6 +507,10 @@ async fn handle_raw_connection(
             Ok((hu_stream, forwarded_ip)) => {
                 if let Some(ip) = forwarded_ip {
                     peer_desc = ip;
+                }
+                if blocklist.is_blocked(&runtime.tag, &peer_desc) {
+                    log_debug!("[{}] ({}): rejected by dynamic source IP block", runtime.tag, peer_desc);
+                    return;
                 }
                 handle_stream(Box::new(hu_stream), runtime, peer_desc).await;
             }
@@ -492,13 +526,19 @@ async fn handle_raw_connection(
         "grpc" | "gun" => {
             let rt = Arc::clone(&runtime);
             let peer = peer_desc.clone();
+            let bl = blocklist.clone();
             if let Err(e) = serve_grpc_connection(
                 stream,
                 transport.grpc.clone(),
                 move |s, forwarded_ip| {
                     let rt = Arc::clone(&rt);
+                    let bl = bl.clone();
                     let peer = forwarded_ip.unwrap_or_else(|| peer.clone());
                     async move {
+                        if bl.is_blocked(&rt.tag, &peer) {
+                            log_debug!("[{}] ({}): rejected by dynamic source IP block", rt.tag, peer);
+                            return;
+                        }
                         handle_stream(s, rt, peer).await;
                     }
                 },

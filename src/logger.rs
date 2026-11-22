@@ -1,4 +1,8 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -13,17 +17,17 @@ pub enum LogLevel {
 
 impl LogLevel {
     pub fn parse(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "none" | "0" => Self::None,
-            "error" | "1" => Self::Error,
-            "warning" | "warn" | "2" => Self::Warning,
-            "info" | "notice" | "3" => Self::Info,
-            "debug" | "4" => Self::Debug,
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" => Self::None,
+            "error" => Self::Error,
+            "warning" | "warn" => Self::Warning,
+            "info" => Self::Info,
+            "debug" => Self::Debug,
             _ => Self::Warning,
         }
     }
 
-    pub fn label(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::None => "NONE",
             Self::Error => "ERROR",
@@ -35,9 +39,41 @@ impl LogLevel {
 }
 
 static LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Warning as u8);
+static ERROR_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+fn error_file_slot() -> &'static Mutex<Option<File>> {
+    ERROR_FILE.get_or_init(|| Mutex::new(None))
+}
 
 pub fn set_level(level: LogLevel) {
     LEVEL.store(level as u8, Ordering::Relaxed);
+}
+
+/// Configures an optional `log.error` file (e.g. `/var/log/xray/error.log`) opened with `O_APPEND`.
+/// Log lines continue to be written to stderr as well so systemd journal remains populated.
+pub fn set_error_file(path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        if let Ok(mut guard) = error_file_slot().lock() {
+            *guard = None;
+        }
+        return Ok(());
+    }
+    let p = Path::new(trimmed);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+        .map_err(|e| format!("failed to open error log '{trimmed}': {e}"))?;
+    if let Ok(mut guard) = error_file_slot().lock() {
+        *guard = Some(f);
+    }
+    Ok(())
 }
 
 #[inline]
@@ -54,10 +90,12 @@ pub fn log_msg(level: LogLevel, args: std::fmt::Arguments<'_>) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if level <= LogLevel::Warning {
-        eprintln!("[{}] {}: {}", ts, level.label(), args);
-    } else {
-        println!("[{}] {}: {}", ts, level.label(), args);
+    let line = format!("[{ts}] {}: {args}\n", level.as_str());
+    eprint!("{line}");
+    if let Ok(mut guard) = error_file_slot().lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -86,7 +124,7 @@ macro_rules! log_info {
 macro_rules! log_debug {
     ($($arg:tt)*) => {
         if $crate::logger::is_enabled($crate::logger::LogLevel::Debug) {
-            $crate::logger::log_msg($crate::logger::LogLevel::Debug, format_args!($($arg)*));
+            $crate::logger::log_msg($crate::logger::LogLevel::Debug, format_args!($($arg)*))
         }
     };
 }

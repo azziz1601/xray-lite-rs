@@ -112,7 +112,7 @@ pub async fn handle_trojan(
     match cmd {
         CMD_TCP => {
             let mut outbound = dial_tcp(&target, runtime.block_private).await?;
-            relay_tcp_with_stats(&mut stream, &mut outbound, counters).await
+            relay_tcp_with_stats(&mut stream, &mut outbound, counters, runtime.block_bittorrent).await
         }
         CMD_UDP => {
             let first_remote = resolve_udp_target(&target, runtime.block_private).await?;

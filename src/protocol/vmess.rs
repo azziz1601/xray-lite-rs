@@ -17,7 +17,7 @@ use tokio::time::timeout;
 
 use crate::address::{parse_vless_vmess_addr_slice, TargetAddr};
 use crate::log_debug;
-use crate::outbound::{bind_udp_for, dial_tcp, resolve_udp_target};
+use crate::outbound::{bind_udp_for, dial_tcp, is_bittorrent_handshake, resolve_udp_target};
 use crate::protocol::InboundRuntime;
 use crate::transport::BoxedStream;
 
@@ -522,9 +522,16 @@ pub async fn handle_vmess(
             let (mut out_r, mut out_w) = outbound.into_split();
 
             let up_counters = counters.clone();
+            let mut check_bt = runtime.block_bittorrent;
             let up = tokio::spawn(async move {
                 while let Ok(Some(chunk)) = req_codec.read_chunk(&mut client_r).await {
                     if !chunk.is_empty() {
+                        if check_bt {
+                            check_bt = false;
+                            if is_bittorrent_handshake(&chunk) {
+                                break;
+                            }
+                        }
                         if out_w.write_all(&chunk).await.is_err() {
                             break;
                         }

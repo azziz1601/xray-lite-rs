@@ -145,6 +145,7 @@ pub struct InboundRuntime {
     pub replay_cache: Arc<ReplayCache>,
     pub fallbacks: Vec<FallbackConfig>,
     pub block_private: bool,
+    pub block_bittorrent: bool,
     pub stats: StatsRegistry,
     pub access_log: AccessLogger,
 }
@@ -153,6 +154,7 @@ impl InboundRuntime {
     pub fn from_config(
         cfg: &InboundConfig,
         block_private: bool,
+        block_bittorrent: bool,
         stats: StatsRegistry,
         access_log: AccessLogger,
     ) -> Result<Self, String> {
@@ -166,6 +168,7 @@ impl InboundRuntime {
             replay_cache: Arc::new(ReplayCache::new()),
             fallbacks: cfg.settings.fallbacks.clone(),
             block_private,
+            block_bittorrent,
             stats,
             access_log,
         })

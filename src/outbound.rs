@@ -16,6 +16,14 @@ use crate::stats::UserTraffic;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const BITTORRENT_HANDSHAKE_PREFIX: &[u8; 20] = b"\x13BitTorrent protocol";
+
+/// Detects standard BitTorrent peer wire protocol handshake on the first TCP payload chunk.
+#[inline]
+pub fn is_bittorrent_handshake(buf: &[u8]) -> bool {
+    buf.len() >= BITTORRENT_HANDSHAKE_PREFIX.len()
+        && &buf[..BITTORRENT_HANDSHAKE_PREFIX.len()] == BITTORRENT_HANDSHAKE_PREFIX
+}
 
 /// Applies `TCP_NODELAY` and kernel TCP keepalive (60s idle / 15s interval) so dead mobile
 /// connections are automatically reaped instead of lingering for hours as zombie sockets.
@@ -82,30 +90,30 @@ pub async fn relay_tcp<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Relays TCP streams bidirectionally while updating real-time per-user uplink/downlink
-/// atomic byte counters on every chunk.
+/// atomic byte counters on every chunk and optionally blocking BitTorrent handshakes.
 pub async fn relay_tcp_with_stats<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
     target: &mut TcpStream,
     stats: Option<Arc<UserTraffic>>,
+    block_bittorrent: bool,
 ) -> io::Result<()> {
-    match stats {
-        Some(counters) => {
-            let mut counted_target = CountingOutbound {
-                inner: target,
-                counters,
-            };
-            let _ = tokio::io::copy_bidirectional(client, &mut counted_target).await;
-        }
-        None => {
-            let _ = tokio::io::copy_bidirectional(client, target).await;
-        }
+    if stats.is_none() && !block_bittorrent {
+        let _ = tokio::io::copy_bidirectional(client, target).await;
+        return Ok(());
     }
+    let mut counted_target = CountingOutbound {
+        inner: target,
+        counters: stats,
+        check_bt: block_bittorrent,
+    };
+    let _ = tokio::io::copy_bidirectional(client, &mut counted_target).await;
     Ok(())
 }
 
 struct CountingOutbound<'a> {
     inner: &'a mut TcpStream,
-    counters: Arc<UserTraffic>,
+    counters: Option<Arc<UserTraffic>>,
+    check_bt: bool,
 }
 
 impl AsyncRead for CountingOutbound<'_> {
@@ -118,7 +126,9 @@ impl AsyncRead for CountingOutbound<'_> {
         let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &res {
             let delta = buf.filled().len().saturating_sub(before);
-            self.counters.add_downlink(delta as u64);
+            if let Some(c) = &self.counters {
+                c.add_downlink(delta as u64);
+            }
         }
         res
     }
@@ -130,9 +140,20 @@ impl AsyncWrite for CountingOutbound<'_> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.check_bt {
+            self.check_bt = false;
+            if is_bittorrent_handshake(buf) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "blocked BitTorrent protocol",
+                )));
+            }
+        }
         let res = Pin::new(&mut *self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &res {
-            self.counters.add_uplink(*n as u64);
+            if let Some(c) = &self.counters {
+                c.add_uplink(*n as u64);
+            }
         }
         res
     }

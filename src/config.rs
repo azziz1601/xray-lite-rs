@@ -18,6 +18,8 @@ pub struct XrayConfig {
     pub outbounds: Vec<OutboundConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    #[serde(default)]
+    pub policy: Option<PolicyConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -264,7 +266,25 @@ pub struct RoutingRule {
     #[serde(default)]
     pub ip: Vec<String>,
     #[serde(default)]
+    pub protocol: Vec<String>,
+    #[serde(default)]
     pub outbound_tag: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyConfig {
+    #[serde(default)]
+    pub levels: HashMap<String, PolicyLevelConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyLevelConfig {
+    #[serde(default)]
+    pub handshake: Option<u64>,
+    #[serde(default)]
+    pub conn_idle: Option<u64>,
 }
 
 impl StreamSettings {
@@ -336,6 +356,35 @@ impl XrayConfig {
         } else {
             Some(p)
         }
+    }
+
+    pub fn error_log_path(&self) -> Option<&str> {
+        let p = self.log.as_ref()?.error.trim();
+        if p.is_empty() || p.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(p)
+        }
+    }
+
+    pub fn block_bittorrent(&self) -> bool {
+        let Some(routing) = &self.routing else {
+            return false;
+        };
+        for rule in &routing.rules {
+            let is_block = rule.outbound_tag.eq_ignore_ascii_case("blocked")
+                || rule.outbound_tag.eq_ignore_ascii_case("block")
+                || rule.outbound_tag.eq_ignore_ascii_case("blackhole");
+            if is_block
+                && rule
+                    .protocol
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("bittorrent"))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn block_private_ips(&self) -> bool {
