@@ -44,7 +44,7 @@ fn build_vless_tcp_request(uuid: &[u8; 16], target: std::net::SocketAddr) -> Vec
     out.push(0x00); // version
     out.extend_from_slice(uuid);
     out.push(0x00); // addons len
-    out.push(0x01); // CMD_TCP
+    out.push(0x00); // CMD_TCP
     out.extend_from_slice(&target.port().to_be_bytes());
     match target {
         std::net::SocketAddr::V4(v4) => {
