@@ -1,0 +1,520 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+use serde::Deserialize;
+
+use crate::logger::LogLevel;
+
+/// Standard Xray-core compatible JSON configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayConfig {
+    #[serde(default)]
+    pub log: Option<LogConfig>,
+    #[serde(default)]
+    pub inbounds: Vec<InboundConfig>,
+    #[serde(default)]
+    pub outbounds: Vec<OutboundConfig>,
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogConfig {
+    #[serde(default = "default_loglevel")]
+    pub loglevel: String,
+}
+
+fn default_loglevel() -> String {
+    "warning".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundConfig {
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub port: PortSpec,
+    pub protocol: String,
+    #[serde(default)]
+    pub settings: InboundSettings,
+    #[serde(default)]
+    pub stream_settings: Option<StreamSettings>,
+}
+
+fn default_listen() -> String {
+    "0.0.0.0".to_string()
+}
+
+/// Xray allows `port` as integer (`443`) or string (`"443"`) or omitted for Unix sockets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PortSpec {
+    Num(u16),
+    Str(String),
+}
+
+impl Default for PortSpec {
+    fn default() -> Self {
+        Self::Num(0)
+    }
+}
+
+impl PortSpec {
+    pub fn as_u16(&self) -> Result<u16, String> {
+        match self {
+            Self::Num(p) => Ok(*p),
+            Self::Str(s) => s
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port '{s}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundSettings {
+    #[serde(default)]
+    pub clients: Vec<ClientConfig>,
+    #[serde(default)]
+    pub decryption: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Vec<FallbackConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConfig {
+    /// UUID for VLESS / VMess.
+    #[serde(default)]
+    pub id: String,
+    /// Password for Trojan.
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub flow: String,
+    #[serde(default)]
+    pub level: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackConfig {
+    #[serde(default)]
+    pub alpn: String,
+    #[serde(default)]
+    pub path: String,
+    pub dest: DestSpec,
+    #[serde(default)]
+    pub xver: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DestSpec {
+    Port(u16),
+    Addr(String),
+}
+
+impl DestSpec {
+    pub fn to_target_string(&self) -> String {
+        match self {
+            Self::Port(p) => format!("127.0.0.1:{p}"),
+            Self::Addr(s) => {
+                if s.contains(':') || s.starts_with('/') {
+                    s.clone()
+                } else {
+                    format!("127.0.0.1:{s}")
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSettings {
+    #[serde(default = "default_network")]
+    pub network: String,
+    #[serde(default = "default_security")]
+    pub security: String,
+    #[serde(default)]
+    pub tls_settings: Option<TlsSettings>,
+    #[serde(default)]
+    pub tcp_settings: Option<TcpSettings>,
+    #[serde(default)]
+    pub ws_settings: Option<WsSettings>,
+    #[serde(default)]
+    pub httpupgrade_settings: Option<HttpUpgradeSettings>,
+    #[serde(default)]
+    pub grpc_settings: Option<GrpcSettings>,
+    #[serde(default)]
+    pub sockopt: Option<SockoptSettings>,
+}
+
+fn default_network() -> String {
+    "tcp".to_string()
+}
+
+fn default_security() -> String {
+    "none".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsSettings {
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub alpn: Vec<String>,
+    #[serde(default)]
+    pub certificates: Vec<CertificateConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateConfig {
+    pub certificate_file: String,
+    pub key_file: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpSettings {
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSettings {
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+    #[serde(default = "default_root_path")]
+    pub path: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpUpgradeSettings {
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+    #[serde(default = "default_root_path")]
+    pub path: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcSettings {
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SockoptSettings {
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+}
+
+fn default_root_path() -> String {
+    "/".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundConfig {
+    #[serde(default)]
+    pub tag: String,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingConfig {
+    #[serde(default)]
+    pub rules: Vec<RoutingRule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingRule {
+    #[serde(default)]
+    pub ip: Vec<String>,
+    #[serde(default)]
+    pub outbound_tag: String,
+}
+
+impl StreamSettings {
+    pub fn accept_proxy_protocol(&self) -> bool {
+        if self
+            .sockopt
+            .as_ref()
+            .map(|s| s.accept_proxy_protocol)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        match self.network.to_ascii_lowercase().as_str() {
+            "tcp" | "raw" => self
+                .tcp_settings
+                .as_ref()
+                .map(|t| t.accept_proxy_protocol)
+                .unwrap_or(false),
+            "ws" | "websocket" => self
+                .ws_settings
+                .as_ref()
+                .map(|w| w.accept_proxy_protocol)
+                .unwrap_or(false),
+            "httpupgrade" => self
+                .httpupgrade_settings
+                .as_ref()
+                .map(|h| h.accept_proxy_protocol)
+                .unwrap_or(false),
+            "grpc" | "gun" => self
+                .grpc_settings
+                .as_ref()
+                .map(|g| g.accept_proxy_protocol)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+}
+
+impl XrayConfig {
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config '{}': {e}", path.display()))?;
+        let cleaned = strip_json_comments(&raw);
+        let cfg: XrayConfig = serde_json::from_str(&cleaned)
+            .map_err(|e| format!("invalid JSON in '{}': {e}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn log_level(&self) -> LogLevel {
+        self.log
+            .as_ref()
+            .map(|l| LogLevel::parse(&l.loglevel))
+            .unwrap_or(LogLevel::Warning)
+    }
+
+    pub fn block_private_ips(&self) -> bool {
+        // Default to true if routing has any geoip:private -> blackhole/block rule, or if no routing specified.
+        let Some(routing) = &self.routing else {
+            return true;
+        };
+        for rule in &routing.rules {
+            if rule.ip.iter().any(|ip| ip == "geoip:private")
+                && (rule.outbound_tag.eq_ignore_ascii_case("blocked")
+                    || rule.outbound_tag.eq_ignore_ascii_case("block")
+                    || rule.outbound_tag.eq_ignore_ascii_case("blackhole"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.inbounds.is_empty() {
+            return Err("config has no inbounds".to_string());
+        }
+        for (idx, inbound) in self.inbounds.iter().enumerate() {
+            let proto = inbound.protocol.to_ascii_lowercase();
+            if !matches!(proto.as_str(), "vless" | "vmess" | "trojan") {
+                return Err(format!(
+                    "inbound[{idx}] ('{}'): unsupported protocol '{}' (supported: vless, vmess, trojan)",
+                    inbound.tag, inbound.protocol
+                ));
+            }
+            if !is_unix_listen(&inbound.listen) {
+                let port = inbound.port.as_u16()?;
+                if port == 0 {
+                    return Err(format!(
+                        "inbound[{idx}] ('{}'): port must be > 0 for TCP listen '{}'",
+                        inbound.tag, inbound.listen
+                    ));
+                }
+            }
+            if let Some(ss) = &inbound.stream_settings {
+                let net = ss.network.to_ascii_lowercase();
+                if !matches!(
+                    net.as_str(),
+                    "tcp" | "raw" | "ws" | "websocket" | "httpupgrade" | "grpc" | "gun"
+                ) {
+                    return Err(format!(
+                        "inbound[{idx}] ('{}'): unsupported network '{}'",
+                        inbound.tag, ss.network
+                    ));
+                }
+                let sec = ss.security.to_ascii_lowercase();
+                if !matches!(sec.as_str(), "" | "none" | "tls") {
+                    return Err(format!(
+                        "inbound[{idx}] ('{}'): unsupported security '{}' (supported: none, tls)",
+                        inbound.tag, ss.security
+                    ));
+                }
+                if sec == "tls" {
+                    let certs = ss
+                        .tls_settings
+                        .as_ref()
+                        .map(|t| t.certificates.len())
+                        .unwrap_or(0);
+                    if certs == 0 {
+                        return Err(format!(
+                            "inbound[{idx}] ('{}'): security=tls requires tlsSettings.certificates",
+                            inbound.tag
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn is_unix_listen(listen: &str) -> bool {
+    listen.starts_with('/') || listen.starts_with('@')
+}
+
+/// Strips `//` line comments and `/* ... */` block comments (standard Xray JSONC support)
+/// while preserving string literals untouched.
+pub fn strip_json_comments(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            out.push(c as char);
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+        } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            out.push(c as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Parses a standard UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) into 16 bytes.
+pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_xray_jsonc_config() {
+        let raw = r#"
+        {
+            // Comment like standard Xray config
+            "log": { "loglevel": "info" },
+            "inbounds": [
+                {
+                    "tag": "vless-ws",
+                    "listen": "127.0.0.1",
+                    "port": 10001,
+                    "protocol": "vless",
+                    "settings": {
+                        "clients": [
+                            { "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "user1" }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "ws",
+                        "security": "none",
+                        "wsSettings": {
+                            "acceptProxyProtocol": true,
+                            "path": "/vless"
+                        }
+                    }
+                }
+            ]
+        }
+        "#;
+        let cleaned = strip_json_comments(raw);
+        let cfg: XrayConfig = serde_json::from_str(&cleaned).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.inbounds.len(), 1);
+        assert!(cfg.inbounds[0].stream_settings.as_ref().unwrap().accept_proxy_protocol());
+    }
+
+    #[test]
+    fn parses_uuid_bytes() {
+        let u = parse_uuid("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        assert_eq!(u[0], 0xb8);
+        assert_eq!(u[15], 0x11);
+    }
+}
