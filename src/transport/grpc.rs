@@ -22,7 +22,7 @@ pub async fn serve_grpc_connection<S, F, Fut>(
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: Fn(BoxedStream) -> Fut + Send + Sync + 'static,
+    F: Fn(BoxedStream, Option<String>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let mut h2_conn = server::handshake(stream)
@@ -71,6 +71,22 @@ where
             }
         };
 
+        let forwarded_ip = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                req.headers()
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            });
         let recv_stream = req.into_body();
         let (app_side, pump_side) = tokio::io::duplex(GRPC_DUPLEX_BUF);
 
@@ -78,7 +94,7 @@ where
 
         let cb = std::sync::Arc::clone(&on_stream);
         tokio::spawn(async move {
-            cb(Box::new(app_side)).await;
+            cb(Box::new(app_side), forwarded_ip).await;
         });
     }
 

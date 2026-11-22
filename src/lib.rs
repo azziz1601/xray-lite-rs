@@ -4,6 +4,7 @@ pub mod logger;
 pub mod outbound;
 pub mod protocol;
 pub mod proxy_protocol;
+pub mod stats;
 pub mod transport;
 
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use crate::config::{
 use crate::outbound::configure_tcp_socket;
 use crate::protocol::{handle_stream, InboundProtocol, InboundRuntime, InboundUsers};
 use crate::proxy_protocol::consume_proxy_protocol;
+use crate::stats::{serve_stats_api_connection, AccessLogger, StatsRegistry};
 use crate::transport::grpc::serve_grpc_connection;
 use crate::transport::httpupgrade::accept_httpupgrade;
 use crate::transport::websocket::accept_websocket;
@@ -161,12 +163,95 @@ pub async fn run_server_with_limit(
     max_connections: usize,
 ) -> Result<(), String> {
     let block_private = cfg.block_private_ips();
+    let stats_registry = StatsRegistry::new();
+    let access_log = match cfg.access_log_path() {
+        Some(path) => match AccessLogger::open(path) {
+            Ok(logger) => {
+                log_info!("access log enabled: {}", path);
+                logger
+            }
+            Err(e) => {
+                log_warn!("{} (continuing without access log)", e);
+                AccessLogger::disabled()
+            }
+        },
+        None => AccessLogger::disabled(),
+    };
+
     let conn_slots = Arc::new(Semaphore::new(max_connections.max(1)));
     let mut tasks = Vec::with_capacity(cfg.inbounds.len());
 
     for (idx, inbound) in cfg.inbounds.iter().enumerate() {
         let key = inbound_key(idx, inbound);
-        let runtime = Arc::new(InboundRuntime::from_config(inbound, block_private)?);
+        let proto_lower = inbound.protocol.to_ascii_lowercase();
+
+        // Serve Xray-compatible gRPC StatsService on `dokodemo-door` API inbound (e.g. 127.0.0.1:10000).
+        if proto_lower == "dokodemo-door" {
+            let port = inbound.port.as_u16()?;
+            let bind_str = if inbound.listen.contains(':') && !inbound.listen.starts_with('[') {
+                format!("[{}]:{}", inbound.listen, port)
+            } else {
+                format!("{}:{}", inbound.listen, port)
+            };
+            let addr: SocketAddr = bind_str
+                .parse()
+                .map_err(|e| format!("invalid API listen address '{bind_str}': {e}"))?;
+            let listener = bind_tcp_listener(addr)
+                .map_err(|e| format!("failed to bind StatsService API '{addr}': {e}"))?;
+            log_info!(
+                "[{}] listening on {} (gRPC StatsService API)",
+                key,
+                listener.local_addr().unwrap_or(addr)
+            );
+            let mut task_shutdown = shutdown_rx.clone();
+            let stats = stats_registry.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let accept_res = tokio::select! {
+                        biased;
+                        _ = task_shutdown.changed() => break,
+                        res = listener.accept() => res,
+                    };
+                    match accept_res {
+                        Ok((stream, _peer)) => {
+                            configure_tcp_socket(&stream);
+                            let st = stats.clone();
+                            tokio::spawn(async move {
+                                let _ = serve_stats_api_connection(stream, st).await;
+                            });
+                        }
+                        Err(e) => {
+                            log_error!("StatsService accept error: {} (backing off 50ms)", e);
+                            tokio::select! {
+                                biased;
+                                _ = task_shutdown.changed() => break,
+                                _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                            }
+                        }
+                    }
+                }
+            });
+            tasks.push(task);
+            continue;
+        }
+
+        // Skip unsupported non-core inbounds (e.g. shadowsocks) gracefully without failing startup.
+        if InboundProtocol::parse(&proto_lower).is_none() {
+            log_warn!(
+                "[{}] skipping unsupported inbound protocol '{}' (listen={})",
+                key,
+                inbound.protocol,
+                inbound.listen
+            );
+            continue;
+        }
+
+        let runtime = Arc::new(InboundRuntime::from_config(
+            inbound,
+            block_private,
+            stats_registry.clone(),
+            access_log.clone(),
+        )?);
         let user_count = runtime
             .users
             .read()
@@ -378,7 +463,10 @@ async fn handle_raw_connection(
             handle_stream(stream, runtime, peer_desc).await;
         }
         "ws" | "websocket" => match accept_websocket(stream, &transport.ws).await {
-            Ok(ws_stream) => {
+            Ok((ws_stream, forwarded_ip)) => {
+                if let Some(ip) = forwarded_ip {
+                    peer_desc = ip;
+                }
                 handle_stream(Box::new(ws_stream), runtime, peer_desc).await;
             }
             Err(e) => {
@@ -386,7 +474,10 @@ async fn handle_raw_connection(
             }
         },
         "httpupgrade" => match accept_httpupgrade(stream, &transport.httpupgrade).await {
-            Ok(hu_stream) => {
+            Ok((hu_stream, forwarded_ip)) => {
+                if let Some(ip) = forwarded_ip {
+                    peer_desc = ip;
+                }
                 handle_stream(Box::new(hu_stream), runtime, peer_desc).await;
             }
             Err(e) => {
@@ -401,13 +492,17 @@ async fn handle_raw_connection(
         "grpc" | "gun" => {
             let rt = Arc::clone(&runtime);
             let peer = peer_desc.clone();
-            if let Err(e) = serve_grpc_connection(stream, transport.grpc.clone(), move |s| {
-                let rt = Arc::clone(&rt);
-                let peer = peer.clone();
-                async move {
-                    handle_stream(s, rt, peer).await;
-                }
-            })
+            if let Err(e) = serve_grpc_connection(
+                stream,
+                transport.grpc.clone(),
+                move |s, forwarded_ip| {
+                    let rt = Arc::clone(&rt);
+                    let peer = forwarded_ip.unwrap_or_else(|| peer.clone());
+                    async move {
+                        handle_stream(s, rt, peer).await;
+                    }
+                },
+            )
             .await
             {
                 log_debug!("[{}] ({}): gRPC error: {}", runtime.tag, peer_desc, e);

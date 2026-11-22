@@ -19,7 +19,7 @@ const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub async fn accept_httpupgrade<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     cfg: &HttpUpgradeSettings,
-) -> io::Result<PrefixedStream<S>> {
+) -> io::Result<(PrefixedStream<S>, Option<String>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
 
@@ -75,6 +75,7 @@ pub async fn accept_httpupgrade<S: AsyncRead + AsyncWrite + Unpin>(
     let mut connection = "";
     let mut upgrade = "";
     let mut ws_key = "";
+    let mut forwarded_ip: Option<String> = None;
 
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -87,6 +88,12 @@ pub async fn accept_httpupgrade<S: AsyncRead + AsyncWrite + Unpin>(
                 upgrade = v;
             } else if k.eq_ignore_ascii_case("sec-websocket-key") {
                 ws_key = v;
+            } else if k.eq_ignore_ascii_case("x-forwarded-for") && forwarded_ip.is_none() {
+                if let Some(first) = v.split(',').next().map(str::trim).filter(|ip| !ip.is_empty()) {
+                    forwarded_ip = Some(first.to_string());
+                }
+            } else if k.eq_ignore_ascii_case("x-real-ip") && forwarded_ip.is_none() && !v.is_empty() {
+                forwarded_ip = Some(v.to_string());
             }
         }
     }
@@ -132,7 +139,7 @@ pub async fn accept_httpupgrade<S: AsyncRead + AsyncWrite + Unpin>(
     stream.flush().await?;
 
     let leftover = buf[(header_end + 4)..].to_vec();
-    Ok(PrefixedStream::new(leftover, stream))
+    Ok((PrefixedStream::new(leftover, stream), forwarded_ip))
 }
 
 pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {

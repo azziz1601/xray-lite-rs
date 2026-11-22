@@ -9,7 +9,7 @@ use aes_gcm::{Aes128Gcm, Nonce};
 use chacha20poly1305::ChaCha20Poly1305;
 use md5::{Digest as Md5Digest, Md5};
 use rand::RngCore;
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::Sha256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -503,6 +503,16 @@ pub async fn handle_vmess(
     // Note: Xray-core server.go uses s.requestBodyKey for auth_len key in EncodeResponseBody too.
     let mut resp_codec = ChunkCodec::new(req.security, &resp_key, &req.req_key, resp_iv, req.option)?;
 
+    let counters = runtime.stats.counters_for(&req.email);
+    let net_label = if req.cmd == CMD_UDP { "udp" } else { "tcp" };
+    runtime.access_log.log_accepted(
+        peer_desc,
+        net_label,
+        &req.target.to_string(),
+        &runtime.tag,
+        &req.email,
+    );
+
     match req.cmd {
         CMD_TCP => {
             let outbound = dial_tcp(&req.target, runtime.block_private).await?;
@@ -511,15 +521,22 @@ pub async fn handle_vmess(
             let (mut client_r, mut client_w) = tokio::io::split(stream);
             let (mut out_r, mut out_w) = outbound.into_split();
 
+            let up_counters = counters.clone();
             let up = tokio::spawn(async move {
                 while let Ok(Some(chunk)) = req_codec.read_chunk(&mut client_r).await {
-                    if !chunk.is_empty() && out_w.write_all(&chunk).await.is_err() {
-                        break;
+                    if !chunk.is_empty() {
+                        if out_w.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                        if let Some(c) = &up_counters {
+                            c.add_uplink(chunk.len() as u64);
+                        }
                     }
                 }
                 let _ = out_w.shutdown().await;
             });
 
+            let down_counters = counters;
             let down = tokio::spawn(async move {
                 let mut buf = vec![0u8; MAX_CHUNK_PLAINTEXT];
                 loop {
@@ -531,6 +548,9 @@ pub async fn handle_vmess(
                         Ok(n) => {
                             if resp_codec.write_chunk(&mut client_w, &buf[..n]).await.is_err() {
                                 break;
+                            }
+                            if let Some(c) = &down_counters {
+                                c.add_downlink(n as u64);
                             }
                         }
                         Err(_) => break,
@@ -551,12 +571,18 @@ pub async fn handle_vmess(
 
             let (mut client_r, mut client_w) = tokio::io::split(stream);
 
+            let up_counters = counters.clone();
             let mut up = tokio::spawn(async move {
                 loop {
                     match timeout(UDP_IDLE_TIMEOUT, req_codec.read_chunk(&mut client_r)).await {
                         Ok(Ok(Some(pkt))) => {
-                            if !pkt.is_empty() && udp.send_to(&pkt, remote_addr).await.is_err() {
-                                break;
+                            if !pkt.is_empty() {
+                                if udp.send_to(&pkt, remote_addr).await.is_err() {
+                                    break;
+                                }
+                                if let Some(c) = &up_counters {
+                                    c.add_uplink(pkt.len() as u64);
+                                }
                             }
                         }
                         _ => break,
@@ -564,6 +590,7 @@ pub async fn handle_vmess(
                 }
             });
 
+            let down_counters = counters;
             let mut down = tokio::spawn(async move {
                 let mut recv_buf = vec![0u8; 65507];
                 loop {
@@ -572,10 +599,15 @@ pub async fn handle_vmess(
                             Ok(Ok((n, _))) => n,
                             _ => break,
                         };
-                    if n > 0 && resp_codec.write_chunk(&mut client_w, &recv_buf[..n]).await.is_err()
-                    {
-                        break;
+                    if n > 0 {
+                        if resp_codec.write_chunk(&mut client_w, &recv_buf[..n]).await.is_err() {
+                            break;
+                        }
+                        if let Some(c) = &down_counters {
+                            c.add_downlink(n as u64);
+                        }
                     }
+
                 }
             });
 

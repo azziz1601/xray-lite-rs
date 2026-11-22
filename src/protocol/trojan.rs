@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use crate::address::{encode_socks5_addr, read_socks5_addr, TargetAddr};
 use crate::log_debug;
-use crate::outbound::{bind_udp_for, dial_tcp, relay_tcp, resolve_udp_target};
+use crate::outbound::{bind_udp_for, dial_tcp, relay_tcp, relay_tcp_with_stats, resolve_udp_target};
 use crate::protocol::InboundRuntime;
 use crate::transport::BoxedStream;
 
@@ -103,10 +103,16 @@ pub async fn handle_trojan(
         target
     );
 
+    let counters = runtime.stats.counters_for(&email);
+    let net_label = if cmd == CMD_UDP { "udp" } else { "tcp" };
+    runtime
+        .access_log
+        .log_accepted(peer_desc, net_label, &target.to_string(), &runtime.tag, &email);
+
     match cmd {
         CMD_TCP => {
             let mut outbound = dial_tcp(&target, runtime.block_private).await?;
-            relay_tcp(&mut stream, &mut outbound).await
+            relay_tcp_with_stats(&mut stream, &mut outbound, counters).await
         }
         CMD_UDP => {
             let first_remote = resolve_udp_target(&target, runtime.block_private).await?;
@@ -116,6 +122,7 @@ pub async fn handle_trojan(
 
             let (mut client_r, mut client_w) = tokio::io::split(stream);
 
+            let up_counters = counters.clone();
             let mut up = tokio::spawn(async move {
                 let mut pkt_buf = Vec::new();
                 loop {
@@ -137,11 +144,16 @@ pub async fn handle_trojan(
                         break;
                     }
                     if let Ok(dest) = resolve_udp_target(&pkt_target, block_private).await {
-                        let _ = udp.send_to(&pkt_buf, dest).await;
+                        if udp.send_to(&pkt_buf, dest).await.is_ok() {
+                            if let Some(c) = &up_counters {
+                                c.add_uplink(pkt_len as u64);
+                            }
+                        }
                     }
                 }
             });
 
+            let down_counters = counters;
             let mut down = tokio::spawn(async move {
                 let mut recv_buf = vec![0u8; 65535];
                 let mut out_frame = Vec::with_capacity(2048);
@@ -151,6 +163,9 @@ pub async fn handle_trojan(
                             Ok(Ok(pair)) => pair,
                             _ => break,
                         };
+                    if let Some(c) = &down_counters {
+                        c.add_downlink(n as u64);
+                    }
                     if n > u16::MAX as usize {
                         continue;
                     }

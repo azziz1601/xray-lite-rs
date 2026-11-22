@@ -47,20 +47,33 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: amd64
+            apt_packages: ""
+            cc_env: CC_x86_64_unknown_linux_musl
+            cc: gcc
+            linker_env: ""
+            linker: ""
           - target: aarch64-unknown-linux-musl
             arch: arm64
+            apt_packages: gcc-aarch64-linux-gnu
+            cc_env: CC_aarch64_unknown_linux_musl
+            cc: aarch64-linux-gnu-gcc
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+            linker: aarch64-linux-gnu-gcc
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install cross-compile toolchain
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
       - name: Setup Rust toolchain (${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install cross
-        run: cargo install cross --locked
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -79,7 +92,13 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=static"
         run: |
-          cross build --release --target ${{ matrix.target }}
+          if [ -n "${{ matrix.cc_env }}" ]; then
+            export ${{ matrix.cc_env }}=${{ matrix.cc }}
+          fi
+          if [ -n "${{ matrix.linker_env }}" ]; then
+            export ${{ matrix.linker_env }}=${{ matrix.linker }}
+          fi
+          cargo build --release --target ${{ matrix.target }}
           file target/${{ matrix.target }}/release/xray-lite
           file target/${{ matrix.target }}/release/xray-lite | grep -q "statically linked"
 

@@ -13,6 +13,7 @@ use sha2::{Digest, Sha224};
 use crate::config::{parse_uuid, ClientConfig, FallbackConfig, InboundConfig};
 use crate::log_warn;
 use crate::protocol::vmess::{derive_auth_id_key, derive_cmd_key, VmessUser};
+use crate::stats::{AccessLogger, StatsRegistry};
 use crate::transport::BoxedStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,10 +145,17 @@ pub struct InboundRuntime {
     pub replay_cache: Arc<ReplayCache>,
     pub fallbacks: Vec<FallbackConfig>,
     pub block_private: bool,
+    pub stats: StatsRegistry,
+    pub access_log: AccessLogger,
 }
 
 impl InboundRuntime {
-    pub fn from_config(cfg: &InboundConfig, block_private: bool) -> Result<Self, String> {
+    pub fn from_config(
+        cfg: &InboundConfig,
+        block_private: bool,
+        stats: StatsRegistry,
+        access_log: AccessLogger,
+    ) -> Result<Self, String> {
         let protocol = InboundProtocol::parse(&cfg.protocol)
             .ok_or_else(|| format!("unsupported protocol '{}'", cfg.protocol))?;
         let users = InboundUsers::from_clients(protocol, &cfg.settings.clients);
@@ -158,6 +166,8 @@ impl InboundRuntime {
             replay_cache: Arc::new(ReplayCache::new()),
             fallbacks: cfg.settings.fallbacks.clone(),
             block_private,
+            stats,
+            access_log,
         })
     }
 }

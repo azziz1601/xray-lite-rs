@@ -1,13 +1,17 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
 use crate::address::{is_private_ip, TargetAddr};
+use crate::stats::UserTraffic;
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
@@ -68,11 +72,76 @@ pub async fn bind_udp_for(remote: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::bind(bind_addr).await
 }
 
-/// Relays TCP streams bidirectionally until both directions finish or error.
+/// Relays TCP streams bidirectionally without traffic accounting (used for fallbacks).
 pub async fn relay_tcp<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
     target: &mut TcpStream,
 ) -> io::Result<()> {
     let _ = tokio::io::copy_bidirectional(client, target).await;
     Ok(())
+}
+
+/// Relays TCP streams bidirectionally while updating real-time per-user uplink/downlink
+/// atomic byte counters on every chunk.
+pub async fn relay_tcp_with_stats<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut S,
+    target: &mut TcpStream,
+    stats: Option<Arc<UserTraffic>>,
+) -> io::Result<()> {
+    match stats {
+        Some(counters) => {
+            let mut counted_target = CountingOutbound {
+                inner: target,
+                counters,
+            };
+            let _ = tokio::io::copy_bidirectional(client, &mut counted_target).await;
+        }
+        None => {
+            let _ = tokio::io::copy_bidirectional(client, target).await;
+        }
+    }
+    Ok(())
+}
+
+struct CountingOutbound<'a> {
+    inner: &'a mut TcpStream,
+    counters: Arc<UserTraffic>,
+}
+
+impl AsyncRead for CountingOutbound<'_> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let delta = buf.filled().len().saturating_sub(before);
+            self.counters.add_downlink(delta as u64);
+        }
+        res
+    }
+}
+
+impl AsyncWrite for CountingOutbound<'_> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.counters.add_uplink(*n as u64);
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
 }

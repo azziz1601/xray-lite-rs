@@ -6,7 +6,7 @@ use tokio::time::timeout;
 
 use crate::address::read_vless_vmess_addr;
 use crate::log_debug;
-use crate::outbound::{bind_udp_for, dial_tcp, relay_tcp, resolve_udp_target};
+use crate::outbound::{bind_udp_for, dial_tcp, relay_tcp_with_stats, resolve_udp_target};
 use crate::protocol::InboundRuntime;
 use crate::transport::BoxedStream;
 
@@ -71,11 +71,17 @@ pub async fn handle_vless(
         target
     );
 
+    let counters = runtime.stats.counters_for(&email);
+    let net_label = if cmd == CMD_UDP { "udp" } else { "tcp" };
+    runtime
+        .access_log
+        .log_accepted(peer_desc, net_label, &target.to_string(), &runtime.tag, &email);
+
     match cmd {
         CMD_TCP => {
             let mut outbound = dial_tcp(&target, runtime.block_private).await?;
             stream.write_all(&[VLESS_VERSION, 0x00]).await?;
-            relay_tcp(&mut stream, &mut outbound).await
+            relay_tcp_with_stats(&mut stream, &mut outbound, counters).await
         }
         CMD_UDP => {
             let remote_addr = resolve_udp_target(&target, runtime.block_private).await?;
@@ -86,6 +92,7 @@ pub async fn handle_vless(
             let udp_send = std::sync::Arc::new(udp);
             let udp_recv = std::sync::Arc::clone(&udp_send);
 
+            let up_counters = counters.clone();
             let mut up = tokio::spawn(async move {
                 let mut len_buf = [0u8; 2];
                 let mut pkt_buf = Vec::new();
@@ -102,9 +109,13 @@ pub async fn handle_vless(
                     if udp_send.send_to(&pkt_buf, remote_addr).await.is_err() {
                         break;
                     }
+                    if let Some(c) = &up_counters {
+                        c.add_uplink(pkt_len as u64);
+                    }
                 }
             });
 
+            let down_counters = counters;
             let mut down = tokio::spawn(async move {
                 let mut recv_buf = vec![0u8; 65535];
                 let mut out_frame = Vec::with_capacity(2048);
@@ -114,6 +125,9 @@ pub async fn handle_vless(
                         Ok(Ok((n, _))) => n,
                         _ => break,
                     };
+                    if let Some(c) = &down_counters {
+                        c.add_downlink(n as u64);
+                    }
                     if n > u16::MAX as usize {
                         continue;
                     }

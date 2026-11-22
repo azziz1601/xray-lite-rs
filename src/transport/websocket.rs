@@ -25,7 +25,7 @@ const WS_SHRINK_THRESHOLD: usize = 32 * 1024;
 pub async fn accept_websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     cfg: &WsSettings,
-) -> io::Result<DuplexStream> {
+) -> io::Result<(DuplexStream, Option<String>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
 
@@ -80,6 +80,7 @@ pub async fn accept_websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
     let mut host = "";
     let mut ws_key = "";
     let mut ws_early_data_hdr = "";
+    let mut forwarded_ip: Option<String> = None;
 
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -90,6 +91,12 @@ pub async fn accept_websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
                 ws_key = v;
             } else if k.eq_ignore_ascii_case("sec-websocket-protocol") {
                 ws_early_data_hdr = v;
+            } else if k.eq_ignore_ascii_case("x-forwarded-for") && forwarded_ip.is_none() {
+                if let Some(first) = v.split(',').next().map(str::trim).filter(|ip| !ip.is_empty()) {
+                    forwarded_ip = Some(first.to_string());
+                }
+            } else if k.eq_ignore_ascii_case("x-real-ip") && forwarded_ip.is_none() && !v.is_empty() {
+                forwarded_ip = Some(v.to_string());
             }
         }
     }
@@ -142,7 +149,7 @@ pub async fn accept_websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
 
     let (app_side, pump_side) = tokio::io::duplex(WS_DUPLEX_BUF);
     tokio::spawn(run_ws_pump(ws_wire, pump_side, early_data));
-    Ok(app_side)
+    Ok((app_side, forwarded_ip))
 }
 
 fn decode_early_data(hdr: &str) -> Option<Vec<u8>> {
