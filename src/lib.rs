@@ -114,7 +114,11 @@ struct TransportConfig {
 impl TransportConfig {
     fn from_stream_settings(ss: Option<&StreamSettings>) -> Result<Self, String> {
         let ss = ss.cloned().unwrap_or_default();
-        let network = ss.network.to_ascii_lowercase();
+        let network = if ss.network.trim().is_empty() {
+            "tcp".to_string()
+        } else {
+            ss.network.to_ascii_lowercase()
+        };
         let is_grpc = network == "grpc" || network == "gun";
         let accept_proxy_protocol = ss.accept_proxy_protocol();
 

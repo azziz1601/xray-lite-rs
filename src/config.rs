@@ -359,7 +359,7 @@ impl XrayConfig {
                 let net = ss.network.to_ascii_lowercase();
                 if !matches!(
                     net.as_str(),
-                    "tcp" | "raw" | "ws" | "websocket" | "httpupgrade" | "grpc" | "gun"
+                    "" | "tcp" | "raw" | "ws" | "websocket" | "httpupgrade" | "grpc" | "gun"
                 ) {
                     return Err(format!(
                         "inbound[{idx}] ('{}'): unsupported network '{}'",
