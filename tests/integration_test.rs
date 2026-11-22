@@ -99,6 +99,7 @@ async fn vless_over_httpupgrade_and_hot_reload() {
         outbounds: vec![],
         // Allow localhost in test by providing empty routing rules (disables private-IP block).
         routing: Some(Default::default()),
+        policy: None,
     };
 
     let registry = HotReloadRegistry::new();
@@ -226,6 +227,7 @@ async fn trojan_tcp_and_ws_handshake() {
         ],
         outbounds: vec![],
         routing: Some(Default::default()),
+        policy: None,
     };
 
     let registry = HotReloadRegistry::new();
