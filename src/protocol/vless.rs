@@ -11,8 +11,8 @@ use crate::protocol::InboundRuntime;
 use crate::transport::BoxedStream;
 
 const VLESS_VERSION: u8 = 0x00;
-const CMD_TCP: u8 = 0x00;
-const CMD_UDP: u8 = 0x01;
+const CMD_TCP: u8 = 0x01;
+const CMD_UDP: u8 = 0x02;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
