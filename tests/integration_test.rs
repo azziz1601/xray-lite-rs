@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -6,7 +7,7 @@ use tokio::sync::watch;
 
 use xray_lite_rs::config::{
     parse_uuid, ClientConfig, HttpUpgradeSettings, InboundConfig, InboundSettings, PortSpec,
-    StreamSettings, WsSettings, XrayConfig,
+    StreamSettings, WsSettings, XhttpSettings, XrayConfig,
 };
 use xray_lite_rs::protocol::trojan_password_hash;
 use xray_lite_rs::{run_server, HotReloadRegistry};
