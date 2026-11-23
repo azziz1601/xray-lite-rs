@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use crate::address::{parse_vless_vmess_addr_slice, TargetAddr};
 use crate::log_debug;
 use crate::outbound::{bind_udp_for, dial_tcp, is_bittorrent_handshake, resolve_udp_target};
-use crate::protocol::InboundRuntime;
+use crate::protocol::{mux, InboundRuntime};
 use crate::transport::BoxedStream;
 
 const KDF_SALT_VMESS_AEAD_KDF: &[u8] = b"VMess AEAD KDF";
@@ -40,6 +40,7 @@ const SEC_CHACHA20_POLY1305: u8 = 4;
 const SEC_NONE: u8 = 5;
 const CMD_TCP: u8 = 1;
 const CMD_UDP: u8 = 2;
+const CMD_MUX: u8 = 3;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CHUNK_PLAINTEXT: usize = 16 * 1024;
@@ -504,14 +505,16 @@ pub async fn handle_vmess(
     let mut resp_codec = ChunkCodec::new(req.security, &resp_key, &req.req_key, resp_iv, req.option)?;
 
     let counters = runtime.stats.counters_for(&req.email);
-    let net_label = if req.cmd == CMD_UDP { "udp" } else { "tcp" };
-    runtime.access_log.log_accepted(
-        peer_desc,
-        net_label,
-        &req.target.to_string(),
-        &runtime.tag,
-        &req.email,
-    );
+    if req.cmd != CMD_MUX {
+        let net_label = if req.cmd == CMD_UDP { "udp" } else { "tcp" };
+        runtime.access_log.log_accepted(
+            peer_desc,
+            net_label,
+            &req.target.to_string(),
+            &runtime.tag,
+            &req.email,
+        );
+    }
 
     match req.cmd {
         CMD_TCP => {
@@ -623,6 +626,45 @@ pub async fn handle_vmess(
                 _ = &mut down => { up.abort(); }
             }
             Ok(())
+        }
+        CMD_MUX => {
+            stream.write_all(&resp_header_bytes).await?;
+            let (mux_side, codec_side) = tokio::io::duplex(16 * 1024);
+            let (mut client_r, mut client_w) = tokio::io::split(stream);
+            let (mut codec_r, mut codec_w) = tokio::io::split(codec_side);
+
+            let up = tokio::spawn(async move {
+                while let Ok(Some(chunk)) = req_codec.read_chunk(&mut client_r).await {
+                    if !chunk.is_empty() && codec_w.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = codec_w.shutdown().await;
+            });
+
+            let down = tokio::spawn(async move {
+                let mut buf = vec![0u8; MAX_CHUNK_PLAINTEXT];
+                loop {
+                    match codec_r.read(&mut buf).await {
+                        Ok(0) => {
+                            let _ = resp_codec.write_chunk(&mut client_w, &[]).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if resp_codec.write_chunk(&mut client_w, &buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = client_w.shutdown().await;
+            });
+
+            let res = mux::handle_mux(mux_side, runtime, peer_desc, &req.email).await;
+            up.abort();
+            down.abort();
+            res
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -744,7 +786,17 @@ fn parse_vmess_request_header(plain: &[u8], email: String) -> io::Result<Decoded
     let security = plain[35] & 0x0F;
     let cmd = plain[37];
 
-    let (target, addr_consumed) = parse_vless_vmess_addr_slice(&plain[38..])?;
+    let (target, addr_consumed) = if cmd == CMD_MUX {
+        (
+            TargetAddr {
+                host: TargetHost::Domain("v1.mux.cool".to_string()),
+                port: 0,
+            },
+            0usize,
+        )
+    } else {
+        parse_vless_vmess_addr_slice(&plain[38..])?
+    };
     let checksum_offset = 38 + addr_consumed + padding_len;
     if plain.len() < checksum_offset + 4 {
         return Err(io::Error::new(

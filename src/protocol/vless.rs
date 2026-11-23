@@ -4,15 +4,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::address::read_vless_vmess_addr;
+use crate::address::{read_vless_vmess_addr, TargetAddr, TargetHost};
 use crate::log_debug;
 use crate::outbound::{bind_udp_for, dial_tcp, relay_tcp_with_stats, resolve_udp_target};
-use crate::protocol::InboundRuntime;
+use crate::protocol::{mux, InboundRuntime};
 use crate::transport::BoxedStream;
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
+const CMD_MUX: u8 = 0x03;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -56,7 +57,14 @@ pub async fn handle_vless(
         }
 
         let cmd = stream.read_u8().await?;
-        let target = read_vless_vmess_addr(&mut stream).await?;
+        let target = if cmd == CMD_MUX {
+            TargetAddr {
+                host: TargetHost::Domain("v1.mux.cool".to_string()),
+                port: 0,
+            }
+        } else {
+            read_vless_vmess_addr(&mut stream).await?
+        };
         Ok((email, cmd, target))
     })
     .await
@@ -72,10 +80,12 @@ pub async fn handle_vless(
     );
 
     let counters = runtime.stats.counters_for(&email);
-    let net_label = if cmd == CMD_UDP { "udp" } else { "tcp" };
-    runtime
-        .access_log
-        .log_accepted(peer_desc, net_label, &target.to_string(), &runtime.tag, &email);
+    if cmd != CMD_MUX {
+        let net_label = if cmd == CMD_UDP { "udp" } else { "tcp" };
+        runtime
+            .access_log
+            .log_accepted(peer_desc, net_label, &target.to_string(), &runtime.tag, &email);
+    }
 
     match cmd {
         CMD_TCP => {
@@ -145,6 +155,10 @@ pub async fn handle_vless(
                 _ = &mut down => { up.abort(); }
             }
             Ok(())
+        }
+        CMD_MUX => {
+            stream.write_all(&[VLESS_VERSION, 0x00]).await?;
+            mux::handle_mux(stream, runtime, peer_desc, &email).await
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,

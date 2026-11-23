@@ -370,3 +370,102 @@ async fn vless_over_xhttp_packet_up_and_stream_down() {
     let _ = tx.send(true);
     let _ = srv.await;
 }
+
+
+#[tokio::test]
+async fn vless_xudp_mux_udp_echo() {
+    let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = udp_echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, src)) = udp_echo.recv_from(&mut buf).await {
+            let _ = udp_echo.send_to(&buf[..n], src).await;
+        }
+    });
+
+    let port = free_local_port();
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let uuid_bytes = parse_uuid(uuid).unwrap();
+
+    let cfg = XrayConfig {
+        log: None,
+        inbounds: vec![InboundConfig {
+            tag: "vless-xudp".to_string(),
+            listen: "127.0.0.1".to_string(),
+            port: PortSpec::Num(port),
+            protocol: "vless".to_string(),
+            settings: InboundSettings {
+                clients: vec![ClientConfig {
+                    id: uuid.to_string(),
+                    password: String::new(),
+                    email: "gamer".to_string(),
+                    flow: String::new(),
+                    level: 0,
+                }],
+                decryption: Some("none".to_string()),
+                fallbacks: vec![],
+            },
+            stream_settings: None,
+        }],
+        outbounds: vec![],
+        routing: Some(Default::default()),
+        policy: None,
+    };
+
+    let registry = HotReloadRegistry::new();
+    let (tx, rx) = watch::channel(false);
+    let srv = tokio::spawn(run_server(cfg, registry, rx));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+    // VLESS header with CMD_MUX (0x03) and NO target address (exact Xray-core XUDP format)
+    let mut hdr = Vec::with_capacity(19);
+    hdr.push(0x00); // version 0
+    hdr.extend_from_slice(&uuid_bytes);
+    hdr.push(0x00); // addons len 0
+    hdr.push(0x03); // CMD_MUX
+    conn.write_all(&hdr).await.unwrap();
+
+    // XUDP STATUS_NEW frame (sid=0, status=1, opt=1, net=2 UDP, PortThenAddr, 8B GlobalID) + payload
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&0u16.to_be_bytes());
+    meta.push(0x01); // New
+    meta.push(0x01); // OptionData
+    meta.push(0x02); // UDP
+    meta.extend_from_slice(&echo_addr.port().to_be_bytes());
+    meta.push(0x01); // IPv4
+    meta.extend_from_slice(&[127, 0, 0, 1]);
+    meta.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // GlobalID
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(meta.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&meta);
+    frame.extend_from_slice(&9u16.to_be_bytes());
+    frame.extend_from_slice(b"game-pkt1");
+    conn.write_all(&frame).await.unwrap();
+
+    // Read VLESS response header [0x00, 0x00]
+    let mut vless_resp = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(3), conn.read_exact(&mut vless_resp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(vless_resp, [0x00, 0x00]);
+
+    // Read XUDP response frame carrying source address + echoed payload
+    let resp_frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        xray_lite_rs::protocol::mux::read_mux_frame(&mut conn),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp_frame.session_id, 0);
+    assert_eq!(resp_frame.status, 0x02); // Keep
+    assert_eq!(resp_frame.network, 0x02); // UDP
+    assert_eq!(resp_frame.payload, b"game-pkt1");
+
+    let _ = tx.send(true);
+    let _ = srv.await;
+}

@@ -1,3 +1,4 @@
+pub mod mux;
 pub mod trojan;
 pub mod vless;
 pub mod vmess;
