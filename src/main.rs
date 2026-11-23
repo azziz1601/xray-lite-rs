@@ -130,7 +130,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if cli.show_version {
-        println!("xray-lite {VERSION} (VLESS, VMess AEAD, Trojan | TCP/TLS/WS/HTTPUpgrade/gRPC)");
+        println!("xray-lite {VERSION} (VLESS, VMess AEAD, Trojan | TCP/TLS/WS/HTTPUpgrade/gRPC/XHTTP)");
         return ExitCode::SUCCESS;
     }
 

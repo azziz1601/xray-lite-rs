@@ -162,6 +162,8 @@ pub struct StreamSettings {
     pub httpupgrade_settings: Option<HttpUpgradeSettings>,
     #[serde(default)]
     pub grpc_settings: Option<GrpcSettings>,
+    #[serde(default, alias = "splithttpSettings")]
+    pub xhttp_settings: Option<XhttpSettings>,
     #[serde(default)]
     pub sockopt: Option<SockoptSettings>,
 }
@@ -232,6 +234,25 @@ pub struct GrpcSettings {
     pub service_name: String,
     #[serde(default)]
     pub accept_proxy_protocol: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XhttpSettings {
+    #[serde(default)]
+    pub accept_proxy_protocol: bool,
+    #[serde(default = "default_root_path")]
+    pub path: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub no_sse_header: bool,
+    #[serde(default)]
+    pub sc_max_each_post_bytes: Option<usize>,
+    #[serde(default)]
+    pub sc_max_buffered_posts: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -317,6 +338,11 @@ impl StreamSettings {
                 .grpc_settings
                 .as_ref()
                 .map(|g| g.accept_proxy_protocol)
+                .unwrap_or(false),
+            "xhttp" | "splithttp" => self
+                .xhttp_settings
+                .as_ref()
+                .map(|x| x.accept_proxy_protocol)
                 .unwrap_or(false),
             _ => false,
         }
@@ -466,7 +492,7 @@ impl XrayConfig {
                 let net = ss.network.to_ascii_lowercase();
                 if !matches!(
                     net.as_str(),
-                    "" | "tcp" | "raw" | "ws" | "websocket" | "httpupgrade" | "grpc" | "gun"
+                    "" | "tcp" | "raw" | "ws" | "websocket" | "httpupgrade" | "grpc" | "gun" | "xhttp" | "splithttp"
                 ) {
                     return Err(format!(
                         "inbound[{idx}] ('{}'): unsupported network '{}'",

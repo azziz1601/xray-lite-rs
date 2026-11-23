@@ -31,6 +31,7 @@ use crate::stats::{serve_stats_api_connection, AccessLogger, DynamicBlocklist, S
 use crate::transport::grpc::serve_grpc_connection;
 use crate::transport::httpupgrade::accept_httpupgrade;
 use crate::transport::websocket::accept_websocket;
+use crate::transport::xhttp::{serve_xhttp_connection, XhttpHub};
 use crate::transport::{build_tls_acceptor, BoxedStream};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
@@ -112,6 +113,7 @@ struct TransportConfig {
     ws: WsSettings,
     httpupgrade: HttpUpgradeSettings,
     grpc: GrpcSettings,
+    xhttp_hub: Option<Arc<XhttpHub>>,
 }
 
 impl TransportConfig {
@@ -135,6 +137,12 @@ impl TransportConfig {
             None
         };
 
+        let xhttp_hub = if network == "xhttp" || network == "splithttp" {
+            Some(XhttpHub::new(ss.xhttp_settings.unwrap_or_default()))
+        } else {
+            None
+        };
+
         Ok(Self {
             network,
             accept_proxy_protocol,
@@ -142,6 +150,7 @@ impl TransportConfig {
             ws: ss.ws_settings.unwrap_or_default(),
             httpupgrade: ss.httpupgrade_settings.unwrap_or_default(),
             grpc: ss.grpc_settings.unwrap_or_default(),
+            xhttp_hub,
         })
     }
 }
@@ -546,6 +555,31 @@ async fn handle_raw_connection(
             .await
             {
                 log_debug!("[{}] ({}): gRPC error: {}", runtime.tag, peer_desc, e);
+            }
+        }
+        "xhttp" | "splithttp" => {
+            let Some(hub) = transport.xhttp_hub.as_ref().map(Arc::clone) else {
+                log_error!("[{}] xhttp hub not initialized", runtime.tag);
+                return;
+            };
+            let rt = Arc::clone(&runtime);
+            let peer = peer_desc.clone();
+            let bl = blocklist.clone();
+            if let Err(e) = serve_xhttp_connection(stream, hub, move |s, forwarded_ip| {
+                let rt = Arc::clone(&rt);
+                let bl = bl.clone();
+                let peer = forwarded_ip.unwrap_or_else(|| peer.clone());
+                async move {
+                    if bl.is_blocked(&rt.tag, &peer) {
+                        log_debug!("[{}] ({}): rejected by dynamic source IP block", rt.tag, peer);
+                        return;
+                    }
+                    handle_stream(s, rt, peer).await;
+                }
+            })
+            .await
+            {
+                log_debug!("[{}] ({}): XHTTP error: {}", runtime.tag, peer_desc, e);
             }
         }
         other => {

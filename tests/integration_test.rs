@@ -272,3 +272,100 @@ async fn trojan_tcp_and_ws_handshake() {
     drop(ws);
     srv.await.unwrap();
 }
+
+
+#[tokio::test]
+async fn vless_over_xhttp_packet_up_and_stream_down() {
+    let echo_addr = spawn_tcp_echo_server().await;
+    let xhttp_port = free_local_port();
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+    let cfg = XrayConfig {
+        log: None,
+        inbounds: vec![InboundConfig {
+            tag: "vless-xhttp".to_string(),
+            listen: "127.0.0.1".to_string(),
+            port: PortSpec::Num(xhttp_port),
+            protocol: "vless".to_string(),
+            settings: InboundSettings {
+                clients: vec![ClientConfig {
+                    id: uuid.to_string(),
+                    password: String::new(),
+                    email: "xhttp-user".to_string(),
+                    flow: String::new(),
+                    level: 0,
+                }],
+                decryption: Some("none".to_string()),
+                fallbacks: vec![],
+            },
+            stream_settings: Some(StreamSettings {
+                network: "xhttp".to_string(),
+                security: "none".to_string(),
+                xhttp_settings: Some(XhttpSettings {
+                    path: "/xhttp".to_string(),
+                    mode: "auto".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }],
+        outbounds: vec![],
+        routing: Some(Default::default()),
+        policy: None,
+    };
+
+    let registry = HotReloadRegistry::new();
+    let (tx, rx) = watch::channel(false);
+    let srv = tokio::spawn(run_server(cfg, registry, rx));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 1. Open GET /xhttp/sess1 (stream-down)
+    let mut down = TcpStream::connect(("127.0.0.1", xhttp_port)).await.unwrap();
+    down.write_all(b"GET /xhttp/sess1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read HTTP/1.1 200 OK headers
+    let mut hdr_buf = Vec::new();
+    let mut b = [0u8; 1];
+    while !hdr_buf.ends_with(b"\r\n\r\n") {
+        down.read_exact(&mut b).await.unwrap();
+        hdr_buf.push(b[0]);
+    }
+    let hdr_str = String::from_utf8_lossy(&hdr_buf);
+    assert!(hdr_str.starts_with("HTTP/1.1 200 OK"));
+    assert!(hdr_str.contains("X-Accel-Buffering: no"));
+
+    // 2. Send VLESS header + payload via POST /xhttp/sess1/0 (packet-up)
+    let uuid_bytes = xray_lite_rs::config::parse_uuid(uuid).unwrap();
+    let mut vless_pkt = build_vless_tcp_request(&uuid_bytes, echo_addr);
+    vless_pkt.extend_from_slice(b"hello-xhttp");
+
+    let mut up = TcpStream::connect(("127.0.0.1", xhttp_port)).await.unwrap();
+    let post_req = format!(
+        "POST /xhttp/sess1/0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        vless_pkt.len()
+    );
+    up.write_all(post_req.as_bytes()).await.unwrap();
+    up.write_all(&vless_pkt).await.unwrap();
+
+    let mut post_resp = String::new();
+    up.read_to_string(&mut post_resp).await.unwrap();
+    assert!(post_resp.starts_with("HTTP/1.1 200 OK"));
+
+    // 3. Read chunked HTTP/1.1 response carrying VLESS response [0x00, 0x00] + "hello-xhttp"
+    let mut collected = Vec::new();
+    let mut tmp = [0u8; 256];
+    while collected.windows(11).position(|w| w == b"hello-xhttp").is_none() {
+        let n = tokio::time::timeout(Duration::from_secs(3), down.read(&mut tmp))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        collected.extend_from_slice(&tmp[..n]);
+    }
+    assert!(collected.windows(11).any(|w| w == b"hello-xhttp"));
+
+    let _ = tx.send(true);
+    let _ = srv.await;
+}

@@ -1,6 +1,7 @@
 pub mod grpc;
 pub mod httpupgrade;
 pub mod websocket;
+pub mod xhttp;
 
 use std::fs::File;
 use std::io::BufReader;
