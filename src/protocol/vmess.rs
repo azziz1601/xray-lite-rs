@@ -15,7 +15,7 @@ use sha3::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::address::{parse_vless_vmess_addr_slice, TargetAddr};
+use crate::address::{parse_vless_vmess_addr_slice, TargetAddr, TargetHost};
 use crate::log_debug;
 use crate::outbound::{bind_udp_for, dial_tcp, is_bittorrent_handshake, resolve_udp_target};
 use crate::protocol::{mux, InboundRuntime};
