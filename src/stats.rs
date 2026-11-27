@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h2::server;
@@ -224,6 +225,7 @@ struct DynamicBlockRule {
 #[derive(Clone, Default)]
 pub struct DynamicBlocklist {
     rules: Arc<RwLock<HashMap<String, Vec<DynamicBlockRule>>>>,
+    has_rules: Arc<AtomicBool>,
 }
 
 impl DynamicBlocklist {
@@ -248,6 +250,7 @@ impl DynamicBlocklist {
             outbound_tag: outbound_tag.to_string(),
             nets,
         });
+        self.has_rules.store(true, Ordering::Release);
         log_info!(
             "[api] RoutingService AddRule tag='{}' inbound='{}' outbound='{}' ips={}",
             tag,
@@ -260,6 +263,7 @@ impl DynamicBlocklist {
     pub fn remove_rule(&self, rule_tag: &str) -> bool {
         let mut map = self.rules.write().unwrap_or_else(|e| e.into_inner());
         let removed = map.remove(rule_tag).is_some();
+        self.has_rules.store(!map.is_empty(), Ordering::Release);
         log_info!(
             "[api] RoutingService RemoveRule tag='{}' removed={}",
             rule_tag,
@@ -270,6 +274,9 @@ impl DynamicBlocklist {
 
     /// Returns `true` if `peer_desc` matches any active blocking rule for `inbound_tag`.
     pub fn is_blocked(&self, inbound_tag: &str, peer_desc: &str) -> bool {
+        if !self.has_rules.load(Ordering::Acquire) {
+            return false;
+        }
         let map = self.rules.read().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return false;
@@ -330,12 +337,12 @@ pub fn parse_peer_ip(peer_desc: &str) -> Option<IpAddr> {
 /// using `O_APPEND` so external log truncation (`echo -n > /var/log/xray/access.log`) stays safe.
 #[derive(Clone, Default)]
 pub struct AccessLogger {
-    file: Option<Arc<Mutex<File>>>,
+    tx: Option<SyncSender<String>>,
 }
 
 impl AccessLogger {
     pub fn disabled() -> Self {
-        Self { file: None }
+        Self { tx: None }
     }
 
     pub fn open(path: &str) -> Result<Self, String> {
@@ -354,9 +361,37 @@ impl AccessLogger {
             .append(true)
             .open(p)
             .map_err(|e| format!("failed to open access log '{trimmed}': {e}"))?;
-        Ok(Self {
-            file: Some(Arc::new(Mutex::new(f))),
-        })
+        let (tx, rx) = mpsc::sync_channel::<String>(2048);
+        let _ = std::thread::Builder::new()
+            .name("xray-access-log".to_string())
+            .spawn(move || {
+                let mut writer = BufWriter::with_capacity(8192, f);
+                let mut dirty = false;
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(line) => {
+                            let _ = writer.write_all(line.as_bytes());
+                            dirty = true;
+                            while let Ok(more) = rx.try_recv() {
+                                let _ = writer.write_all(more.as_bytes());
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if dirty {
+                                let _ = writer.flush();
+                                dirty = false;
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            if dirty {
+                                let _ = writer.flush();
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        Ok(Self { tx: Some(tx) })
     }
 
     /// Formats a line compatible with Xray-core & VPS scripts (`cekws`, `cekvless`, `cektr`, `limit-ip`):
@@ -369,13 +404,11 @@ impl AccessLogger {
         tag: &str,
         email: &str,
     ) {
-        let Some(file_lock) = &self.file else {
+        let Some(tx) = &self.tx else {
             return;
         };
         let line = format_access_line(peer_desc, net, target, tag, email);
-        if let Ok(mut f) = file_lock.lock() {
-            let _ = f.write_all(line.as_bytes());
-        }
+        let _ = tx.try_send(line);
     }
 }
 

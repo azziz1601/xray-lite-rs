@@ -4,7 +4,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use sha1::{Digest, Sha1};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::timeout;
 
 use crate::config::WsSettings;
@@ -166,7 +166,8 @@ async fn run_ws_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     app: DuplexStream,
     early_data: Option<Vec<u8>>,
 ) {
-    let (mut wire_r, mut wire_w) = tokio::io::split(wire);
+    let (wire_r_raw, mut wire_w) = tokio::io::split(wire);
+    let mut wire_r = BufReader::with_capacity(16 * 1024, wire_r_raw);
     let (mut app_r, mut app_w) = tokio::io::split(app);
     let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
 
@@ -252,9 +253,10 @@ async fn run_ws_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let _ = app_w.shutdown().await;
     });
 
-    // Writer task: app_r + control frames -> wire_w
+    // Writer task: app_r + control frames -> wire_w (zero-copy 10B headroom framing)
     let mut write_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
+        const HEADROOM: usize = 10;
+        let mut buf = vec![0u8; HEADROOM + 16 * 1024];
         loop {
             tokio::select! {
                 biased;
@@ -263,7 +265,7 @@ async fn run_ws_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         break;
                     }
                 }
-                res = app_r.read(&mut buf) => {
+                res = app_r.read(&mut buf[HEADROOM..]) => {
                     match res {
                         Ok(0) => {
                             let close = build_ws_frame(0x08, &[]);
@@ -271,8 +273,8 @@ async fn run_ws_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             break;
                         }
                         Ok(n) => {
-                            let frame = build_ws_frame(0x02, &buf[..n]);
-                            if wire_w.write_all(&frame).await.is_err() {
+                            let start = write_ws_header_before(&mut buf, HEADROOM, 0x02, n);
+                            if wire_w.write_all(&buf[start..HEADROOM + n]).await.is_err() {
                                 break;
                             }
                         }
@@ -314,4 +316,27 @@ pub(crate) fn build_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(payload);
     out
+}
+
+/// Writes an unmasked RFC 6455 header directly before `payload_start` and returns the frame start index.
+#[inline]
+fn write_ws_header_before(buf: &mut [u8], payload_start: usize, opcode: u8, len: usize) -> usize {
+    if len <= 125 {
+        let start = payload_start - 2;
+        buf[start] = 0x80 | (opcode & 0x0F);
+        buf[start + 1] = len as u8;
+        start
+    } else if len <= 65535 {
+        let start = payload_start - 4;
+        buf[start] = 0x80 | (opcode & 0x0F);
+        buf[start + 1] = 126;
+        buf[start + 2..start + 4].copy_from_slice(&(len as u16).to_be_bytes());
+        start
+    } else {
+        let start = payload_start - 10;
+        buf[start] = 0x80 | (opcode & 0x0F);
+        buf[start + 1] = 127;
+        buf[start + 2..start + 10].copy_from_slice(&(len as u64).to_be_bytes());
+        start
+    }
 }

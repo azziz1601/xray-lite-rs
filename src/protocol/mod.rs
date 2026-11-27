@@ -147,6 +147,7 @@ pub struct InboundRuntime {
     pub fallbacks: Vec<FallbackConfig>,
     pub block_private: bool,
     pub block_bittorrent: bool,
+    pub conn_idle: Duration,
     pub stats: StatsRegistry,
     pub access_log: AccessLogger,
 }
@@ -156,6 +157,7 @@ impl InboundRuntime {
         cfg: &InboundConfig,
         block_private: bool,
         block_bittorrent: bool,
+        conn_idle: Duration,
         stats: StatsRegistry,
         access_log: AccessLogger,
     ) -> Result<Self, String> {
@@ -170,6 +172,7 @@ impl InboundRuntime {
             fallbacks: cfg.settings.fallbacks.clone(),
             block_private,
             block_bittorrent,
+            conn_idle,
             stats,
             access_log,
         })

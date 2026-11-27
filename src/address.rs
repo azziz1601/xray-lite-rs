@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -33,13 +36,8 @@ impl TargetAddr {
             TargetHost::Ipv4(ip) => Ok(SocketAddr::new(IpAddr::V4(*ip), self.port)),
             TargetHost::Ipv6(ip) => Ok(SocketAddr::new(IpAddr::V6(*ip), self.port)),
             TargetHost::Domain(domain) => {
-                let mut addrs = tokio::net::lookup_host((domain.as_str(), self.port)).await?;
-                addrs.next().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("DNS resolution returned no addresses for {domain}"),
-                    )
-                })
+                let ip = resolve_domain_cached(domain, self.port).await?;
+                Ok(SocketAddr::new(ip, self.port))
             }
         }
     }
@@ -56,6 +54,51 @@ impl TargetAddr {
             },
         }
     }
+}
+
+
+const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const DNS_CACHE_MAX_ENTRIES: usize = 1024;
+
+static DNS_CACHE: OnceLock<RwLock<HashMap<String, (IpAddr, Instant)>>> = OnceLock::new();
+
+fn dns_cache() -> &'static RwLock<HashMap<String, (IpAddr, Instant)>> {
+    DNS_CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(128)))
+}
+
+async fn resolve_domain_cached(domain: &str, port: u16) -> io::Result<IpAddr> {
+    let key = domain.to_ascii_lowercase();
+    let now = Instant::now();
+    {
+        let map = dns_cache().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(ip, ts)) = map.get(&key) {
+            if now.duration_since(ts) < DNS_CACHE_TTL {
+                return Ok(ip);
+            }
+        }
+    }
+
+    let mut addrs = tokio::net::lookup_host((domain, port)).await?;
+    let addr = addrs.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("DNS resolution returned no addresses for {domain}"),
+        )
+    })?;
+    let ip = addr.ip();
+
+    {
+        let mut map = dns_cache().write().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= DNS_CACHE_MAX_ENTRIES {
+            map.retain(|_, &mut (_, ts)| now.duration_since(ts) < DNS_CACHE_TTL);
+            if map.len() >= DNS_CACHE_MAX_ENTRIES {
+                map.clear();
+            }
+        }
+        map.insert(key, (ip, now));
+    }
+
+    Ok(ip)
 }
 
 /// Checks if an IP is loopback, private, link-local, or unspecified (SSRF protection).

@@ -1,10 +1,11 @@
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes::cipher::BlockDecrypt;
 use aes::Aes128;
-use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit as AeadKeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use chacha20poly1305::ChaCha20Poly1305;
 use md5::{Digest as Md5Digest, Md5};
@@ -12,7 +13,7 @@ use rand::RngCore;
 use sha2::Sha256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Shake128, Shake128Reader};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 use crate::address::{parse_vless_vmess_addr_slice, TargetAddr, TargetHost};
@@ -203,29 +204,29 @@ impl ChunkCipher {
         }
     }
 
-    fn decrypt(&self, nonce12: &[u8; 12], ciphertext: &[u8]) -> io::Result<Vec<u8>> {
+    fn decrypt_in_place(&self, nonce12: &[u8; 12], buf: &mut Vec<u8>) -> io::Result<()> {
         let nonce = Nonce::from_slice(nonce12);
         match self {
             Self::Aes128Gcm(c) => c
-                .decrypt(nonce, ciphertext)
+                .decrypt_in_place(nonce, b"", buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "VMess chunk decrypt failed")),
             Self::ChaCha20Poly1305(c) => c
-                .decrypt(nonce, ciphertext)
+                .decrypt_in_place(nonce, b"", buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "VMess chunk decrypt failed")),
-            Self::None => Ok(ciphertext.to_vec()),
+            Self::None => Ok(()),
         }
     }
 
-    fn encrypt(&self, nonce12: &[u8; 12], plaintext: &[u8]) -> io::Result<Vec<u8>> {
+    fn encrypt_in_place(&self, nonce12: &[u8; 12], buf: &mut Vec<u8>) -> io::Result<()> {
         let nonce = Nonce::from_slice(nonce12);
         match self {
             Self::Aes128Gcm(c) => c
-                .encrypt(nonce, plaintext)
+                .encrypt_in_place(nonce, b"", buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "VMess chunk encrypt failed")),
             Self::ChaCha20Poly1305(c) => c
-                .encrypt(nonce, plaintext)
+                .encrypt_in_place(nonce, b"", buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "VMess chunk encrypt failed")),
-            Self::None => Ok(plaintext.to_vec()),
+            Self::None => Ok(()),
         }
     }
 }
@@ -238,6 +239,9 @@ struct ChunkCodec {
     len_count: u16,
     shake: Option<ShakeSizeParser>,
     global_padding: bool,
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    scratch_buf: Vec<u8>,
 }
 
 impl ChunkCodec {
@@ -281,6 +285,9 @@ impl ChunkCodec {
             len_count: 0,
             shake,
             global_padding,
+            read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            scratch_buf: Vec::new(),
         })
     }
 
@@ -300,17 +307,18 @@ impl ChunkCodec {
         n
     }
 
-    /// Reads one decrypted VMess chunk. Returns `Ok(None)` on EOF marker chunk.
+    /// Reads one decrypted VMess chunk into the reusable internal buffer (0 allocs/chunk).
+    /// Returns `Ok(None)` on EOF marker chunk.
     async fn read_chunk<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> io::Result<Option<&[u8]>> {
         let overhead = self.cipher.overhead();
 
         let (chunk_size, padding_len) = if self.len_cipher.is_some() {
             // AEADChunkSizeParser: 2 bytes length + 16 bytes tag = 18 bytes.
-            let mut enc_len = [0u8; 18];
-            if let Err(e) = reader.read_exact(&mut enc_len).await {
+            self.read_buf.resize(18, 0);
+            if let Err(e) = reader.read_exact(&mut self.read_buf).await {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
                     return Ok(None);
                 }
@@ -322,15 +330,19 @@ impl ChunkCodec {
                 0
             };
             let nonce = self.next_len_nonce();
-            let plain_len = self.len_cipher.as_ref().unwrap().decrypt(&nonce, &enc_len)?;
-            if plain_len.len() != 2 {
+            self.len_cipher
+                .as_ref()
+                .unwrap()
+                .decrypt_in_place(&nonce, &mut self.read_buf)?;
+            if self.read_buf.len() != 2 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid VMess auth_len",
                 ));
             }
             // Xray AEADChunkSizeParser encodes payload_len - overhead; decode adds overhead back.
-            let decoded = u16::from_be_bytes([plain_len[0], plain_len[1]]) as usize + overhead;
+            let decoded =
+                u16::from_be_bytes([self.read_buf[0], self.read_buf[1]]) as usize + overhead;
             (decoded, padding_len)
         } else {
             let mut size_raw = [0u8; 2];
@@ -362,16 +374,38 @@ impl ChunkCodec {
             ));
         }
 
-        let mut raw = vec![0u8; chunk_size];
-        reader.read_exact(&mut raw).await?;
+        self.read_buf.resize(chunk_size, 0);
+        reader.read_exact(&mut self.read_buf).await?;
 
         let ct_len = chunk_size - padding_len;
+        self.read_buf.truncate(ct_len);
         let nonce = self.next_nonce();
-        let plain = self.cipher.decrypt(&nonce, &raw[..ct_len])?;
-        Ok(Some(plain))
+        self.cipher.decrypt_in_place(&nonce, &mut self.read_buf)?;
+        Ok(Some(&self.read_buf))
     }
 
-    /// Encrypts and writes one VMess chunk (or EOF marker if `plaintext.is_empty()`).
+    fn encode_len_into_write_buf(&mut self, total_len: usize, overhead: usize) -> io::Result<()> {
+        self.write_buf.clear();
+        if self.len_cipher.is_some() {
+            let raw_val = total_len.saturating_sub(overhead) as u16;
+            self.write_buf.extend_from_slice(&raw_val.to_be_bytes());
+            let nonce = self.next_len_nonce();
+            self.len_cipher
+                .as_ref()
+                .unwrap()
+                .encrypt_in_place(&nonce, &mut self.write_buf)
+        } else {
+            let b = match &mut self.shake {
+                Some(s) => s.encode_size(total_len as u16),
+                None => (total_len as u16).to_be_bytes(),
+            };
+            self.write_buf.extend_from_slice(&b);
+            Ok(())
+        }
+    }
+
+    /// Encrypts and writes one VMess chunk (or EOF marker if `plaintext.is_empty()`)
+    /// using reusable internal buffers (0 heap allocations per chunk in steady state).
     async fn write_chunk<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -384,32 +418,16 @@ impl ChunkCodec {
             0
         };
 
-        let encode_len = |this: &mut Self, total_len: usize| -> io::Result<Vec<u8>> {
-            if this.len_cipher.is_some() {
-                let raw_val = total_len.saturating_sub(overhead) as u16;
-                let nonce = this.next_len_nonce();
-                this.len_cipher
-                    .as_ref()
-                    .unwrap()
-                    .encrypt(&nonce, &raw_val.to_be_bytes())
-            } else {
-                let b = match &mut this.shake {
-                    Some(s) => s.encode_size(total_len as u16),
-                    None => (total_len as u16).to_be_bytes(),
-                };
-                Ok(b.to_vec())
-            }
-        };
-
         if plaintext.is_empty() {
-            let size_bytes = encode_len(self, overhead + padding_len)?;
-            writer.write_all(&size_bytes).await?;
-            return Ok(());
+            self.encode_len_into_write_buf(overhead + padding_len, overhead)?;
+            return writer.write_all(&self.write_buf).await;
         }
 
+        self.scratch_buf.clear();
+        self.scratch_buf.extend_from_slice(plaintext);
         let nonce = self.next_nonce();
-        let ct = self.cipher.encrypt(&nonce, plaintext)?;
-        let total_len = ct.len() + padding_len;
+        self.cipher.encrypt_in_place(&nonce, &mut self.scratch_buf)?;
+        let total_len = self.scratch_buf.len() + padding_len;
         if total_len > u16::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -417,17 +435,14 @@ impl ChunkCodec {
             ));
         }
 
-        let size_bytes = encode_len(self, total_len)?;
-
-        let mut frame = Vec::with_capacity(size_bytes.len() + total_len);
-        frame.extend_from_slice(&size_bytes);
-        frame.extend_from_slice(&ct);
+        self.encode_len_into_write_buf(total_len, overhead)?;
+        self.write_buf.extend_from_slice(&self.scratch_buf);
         if padding_len > 0 {
-            let start = frame.len();
-            frame.resize(start + padding_len, 0);
-            rand::rngs::OsRng.fill_bytes(&mut frame[start..]);
+            let start = self.write_buf.len();
+            self.write_buf.resize(start + padding_len, 0);
+            rand::thread_rng().fill_bytes(&mut self.write_buf[start..]);
         }
-        writer.write_all(&frame).await
+        writer.write_all(&self.write_buf).await
     }
 }
 
@@ -521,21 +536,25 @@ pub async fn handle_vmess(
             let outbound = dial_tcp(&req.target, runtime.block_private).await?;
             stream.write_all(&resp_header_bytes).await?;
 
-            let (mut client_r, mut client_w) = tokio::io::split(stream);
+            let (client_r_raw, mut client_w) = tokio::io::split(stream);
+            let mut client_r = BufReader::with_capacity(16 * 1024, client_r_raw);
             let (mut out_r, mut out_w) = outbound.into_split();
 
+            let active = Arc::new(AtomicBool::new(false));
+            let up_active = Arc::clone(&active);
             let up_counters = counters.clone();
             let mut check_bt = runtime.block_bittorrent;
-            let up = tokio::spawn(async move {
+            let mut up = tokio::spawn(async move {
                 while let Ok(Some(chunk)) = req_codec.read_chunk(&mut client_r).await {
                     if !chunk.is_empty() {
+                        up_active.store(true, Ordering::Relaxed);
                         if check_bt {
                             check_bt = false;
-                            if is_bittorrent_handshake(&chunk) {
+                            if is_bittorrent_handshake(chunk) {
                                 break;
                             }
                         }
-                        if out_w.write_all(&chunk).await.is_err() {
+                        if out_w.write_all(chunk).await.is_err() {
                             break;
                         }
                         if let Some(c) = &up_counters {
@@ -546,8 +565,9 @@ pub async fn handle_vmess(
                 let _ = out_w.shutdown().await;
             });
 
+            let down_active = Arc::clone(&active);
             let down_counters = counters;
-            let down = tokio::spawn(async move {
+            let mut down = tokio::spawn(async move {
                 let mut buf = vec![0u8; MAX_CHUNK_PLAINTEXT];
                 loop {
                     match out_r.read(&mut buf).await {
@@ -556,6 +576,7 @@ pub async fn handle_vmess(
                             break;
                         }
                         Ok(n) => {
+                            down_active.store(true, Ordering::Relaxed);
                             if resp_codec.write_chunk(&mut client_w, &buf[..n]).await.is_err() {
                                 break;
                             }
@@ -569,7 +590,24 @@ pub async fn handle_vmess(
                 let _ = client_w.shutdown().await;
             });
 
-            let _ = tokio::join!(up, down);
+            let mut tick = tokio::time::interval(runtime.conn_idle);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            let mut up_done = false;
+            let mut down_done = false;
+            while !(up_done && down_done) {
+                tokio::select! {
+                    _ = &mut up, if !up_done => { up_done = true; }
+                    _ = &mut down, if !down_done => { down_done = true; }
+                    _ = tick.tick() => {
+                        if !active.swap(false, Ordering::Relaxed) {
+                            if !up_done { up.abort(); }
+                            if !down_done { down.abort(); }
+                            break;
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         CMD_UDP => {
@@ -579,7 +617,8 @@ pub async fn handle_vmess(
 
             stream.write_all(&resp_header_bytes).await?;
 
-            let (mut client_r, mut client_w) = tokio::io::split(stream);
+            let (client_r_raw, mut client_w) = tokio::io::split(stream);
+            let mut client_r = BufReader::with_capacity(16 * 1024, client_r_raw);
 
             let up_counters = counters.clone();
             let mut up = tokio::spawn(async move {
@@ -587,7 +626,7 @@ pub async fn handle_vmess(
                     match timeout(UDP_IDLE_TIMEOUT, req_codec.read_chunk(&mut client_r)).await {
                         Ok(Ok(Some(pkt))) => {
                             if !pkt.is_empty() {
-                                if udp.send_to(&pkt, remote_addr).await.is_err() {
+                                if udp.send_to(pkt, remote_addr).await.is_err() {
                                     break;
                                 }
                                 if let Some(c) = &up_counters {
@@ -602,7 +641,7 @@ pub async fn handle_vmess(
 
             let down_counters = counters;
             let mut down = tokio::spawn(async move {
-                let mut recv_buf = vec![0u8; 65507];
+                let mut recv_buf = vec![0u8; 8192];
                 loop {
                     let n =
                         match timeout(UDP_IDLE_TIMEOUT, udp_recv.recv_from(&mut recv_buf)).await {
@@ -630,12 +669,13 @@ pub async fn handle_vmess(
         CMD_MUX => {
             stream.write_all(&resp_header_bytes).await?;
             let (mux_side, codec_side) = tokio::io::duplex(16 * 1024);
-            let (mut client_r, mut client_w) = tokio::io::split(stream);
+            let (client_r_raw, mut client_w) = tokio::io::split(stream);
+            let mut client_r = BufReader::with_capacity(16 * 1024, client_r_raw);
             let (mut codec_r, mut codec_w) = tokio::io::split(codec_side);
 
             let up = tokio::spawn(async move {
                 while let Ok(Some(chunk)) = req_codec.read_chunk(&mut client_r).await {
-                    if !chunk.is_empty() && codec_w.write_all(&chunk).await.is_err() {
+                    if !chunk.is_empty() && codec_w.write_all(chunk).await.is_err() {
                         break;
                     }
                 }

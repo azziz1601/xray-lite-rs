@@ -174,6 +174,7 @@ pub async fn run_server_with_limit(
 ) -> Result<(), String> {
     let block_private = cfg.block_private_ips();
     let block_bittorrent = cfg.block_bittorrent();
+    let conn_idle = cfg.conn_idle_timeout();
     let stats_registry = StatsRegistry::new();
     let blocklist = DynamicBlocklist::new();
     if let Some(err_path) = cfg.error_log_path() {
@@ -269,6 +270,7 @@ pub async fn run_server_with_limit(
             inbound,
             block_private,
             block_bittorrent,
+            conn_idle,
             stats_registry.clone(),
             access_log.clone(),
         )?);

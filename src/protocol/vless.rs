@@ -91,7 +91,14 @@ pub async fn handle_vless(
         CMD_TCP => {
             let mut outbound = dial_tcp(&target, runtime.block_private).await?;
             stream.write_all(&[VLESS_VERSION, 0x00]).await?;
-            relay_tcp_with_stats(&mut stream, &mut outbound, counters, runtime.block_bittorrent).await
+            relay_tcp_with_stats(
+                &mut stream,
+                &mut outbound,
+                counters,
+                runtime.block_bittorrent,
+                runtime.conn_idle,
+            )
+            .await
         }
         CMD_UDP => {
             let remote_addr = resolve_udp_target(&target, runtime.block_private).await?;
@@ -127,7 +134,7 @@ pub async fn handle_vless(
 
             let down_counters = counters;
             let mut down = tokio::spawn(async move {
-                let mut recv_buf = vec![0u8; 65535];
+                let mut recv_buf = vec![0u8; 8192];
                 let mut out_frame = Vec::with_capacity(2048);
                 loop {
                     let n = match timeout(UDP_IDLE_TIMEOUT, udp_recv.recv_from(&mut recv_buf)).await

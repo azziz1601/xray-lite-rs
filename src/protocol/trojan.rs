@@ -112,7 +112,14 @@ pub async fn handle_trojan(
     match cmd {
         CMD_TCP => {
             let mut outbound = dial_tcp(&target, runtime.block_private).await?;
-            relay_tcp_with_stats(&mut stream, &mut outbound, counters, runtime.block_bittorrent).await
+            relay_tcp_with_stats(
+                &mut stream,
+                &mut outbound,
+                counters,
+                runtime.block_bittorrent,
+                runtime.conn_idle,
+            )
+            .await
         }
         CMD_UDP => {
             let first_remote = resolve_udp_target(&target, runtime.block_private).await?;
@@ -155,7 +162,7 @@ pub async fn handle_trojan(
 
             let down_counters = counters;
             let mut down = tokio::spawn(async move {
-                let mut recv_buf = vec![0u8; 65535];
+                let mut recv_buf = vec![0u8; 8192];
                 let mut out_frame = Vec::with_capacity(2048);
                 loop {
                     let (n, src) =

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -391,6 +392,17 @@ impl XrayConfig {
         } else {
             Some(p)
         }
+    }
+
+    pub fn conn_idle_timeout(&self) -> Duration {
+        let secs = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.levels.get("0"))
+            .and_then(|l| l.conn_idle)
+            .unwrap_or(300)
+            .max(10);
+        Duration::from_secs(secs)
     }
 
     pub fn block_bittorrent(&self) -> bool {

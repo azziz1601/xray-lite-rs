@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -69,7 +69,8 @@ pub async fn handle_mux<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     peer_desc: &str,
     email: &str,
 ) -> io::Result<()> {
-    let (mut client_r, mut client_w) = tokio::io::split(stream);
+    let (client_r_raw, mut client_w) = tokio::io::split(stream);
+    let mut client_r = BufReader::with_capacity(16 * 1024, client_r_raw);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(128);
 
     // Single serialized writer task so concurrent UDP/TCP sub-sessions never interleave frames.
@@ -84,9 +85,15 @@ pub async fn handle_mux<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     let counters = runtime.stats.counters_for(email);
     let mut sessions: HashMap<u16, SessionHandle> = HashMap::new();
+    let mut meta_buf = Vec::with_capacity(64);
 
     loop {
-        let frame = match timeout(MUX_IDLE_TIMEOUT, read_mux_frame(&mut client_r)).await {
+        let frame = match timeout(
+            MUX_IDLE_TIMEOUT,
+            read_mux_frame_with_buf(&mut client_r, &mut meta_buf),
+        )
+        .await
+        {
             Ok(Ok(f)) => f,
             Ok(Err(_)) | Err(_) => break,
         };
@@ -252,7 +259,7 @@ async fn run_mux_udp_session(
     let out_tx_down = out_tx.clone();
     let down_counters = counters;
     let mut down_task = tokio::spawn(async move {
-        let mut recv_buf = vec![0u8; 65507];
+        let mut recv_buf = vec![0u8; 8192];
         loop {
             let (n, src) = match timeout(UDP_IDLE_TIMEOUT, udp_recv.recv_from(&mut recv_buf)).await
             {
@@ -346,6 +353,14 @@ async fn run_mux_tcp_session(
 
 /// Reads a single Mux.Cool / XUDP frame from `reader`.
 pub async fn read_mux_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<MuxFrame> {
+    let mut meta = Vec::with_capacity(64);
+    read_mux_frame_with_buf(reader, &mut meta).await
+}
+
+async fn read_mux_frame_with_buf<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    meta: &mut Vec<u8>,
+) -> io::Result<MuxFrame> {
     let meta_len = reader.read_u16().await? as usize;
     if !(4..=MAX_META_LEN).contains(&meta_len) {
         return Err(io::Error::new(
@@ -353,8 +368,8 @@ pub async fn read_mux_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<
             format!("invalid Mux metadata length {meta_len}"),
         ));
     }
-    let mut meta = vec![0u8; meta_len];
-    reader.read_exact(&mut meta).await?;
+    meta.resize(meta_len, 0);
+    reader.read_exact(meta).await?;
 
     let session_id = u16::from_be_bytes([meta[0], meta[1]]);
     let status = meta[2];
@@ -400,16 +415,15 @@ pub async fn read_mux_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<
 
 /// Encodes a Mux/XUDP UDP response frame (`SessionStatusKeep` + `OptionData` + `NET_UDP` + `src`).
 pub fn encode_udp_keep_frame(session_id: u16, src: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let mut meta = Vec::with_capacity(24);
-    meta.extend_from_slice(&session_id.to_be_bytes());
-    meta.push(STATUS_KEEP);
-    meta.push(OPT_DATA);
-    meta.push(NET_UDP);
-    encode_port_then_socket_addr(src, &mut meta);
-
-    let mut out = Vec::with_capacity(2 + meta.len() + 2 + payload.len());
-    out.extend_from_slice(&(meta.len() as u16).to_be_bytes());
-    out.extend_from_slice(&meta);
+    let mut out = Vec::with_capacity(28 + payload.len());
+    out.extend_from_slice(&[0u8, 0u8]);
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out.push(STATUS_KEEP);
+    out.push(OPT_DATA);
+    out.push(NET_UDP);
+    encode_port_then_socket_addr(src, &mut out);
+    let meta_len = (out.len() - 2) as u16;
+    out[0..2].copy_from_slice(&meta_len.to_be_bytes());
     out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     out.extend_from_slice(payload);
     out

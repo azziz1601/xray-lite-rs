@@ -1,6 +1,7 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -90,23 +91,36 @@ pub async fn relay_tcp<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Relays TCP streams bidirectionally while updating real-time per-user uplink/downlink
-/// atomic byte counters on every chunk and optionally blocking BitTorrent handshakes.
+/// atomic byte counters on every chunk, optionally blocking BitTorrent handshakes,
+/// and enforcing `conn_idle` so silent zombie TCP streams are reaped automatically.
 pub async fn relay_tcp_with_stats<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
     target: &mut TcpStream,
     stats: Option<Arc<UserTraffic>>,
     block_bittorrent: bool,
+    conn_idle: Duration,
 ) -> io::Result<()> {
-    if stats.is_none() && !block_bittorrent {
-        let _ = tokio::io::copy_bidirectional(client, target).await;
-        return Ok(());
-    }
+    let active = Arc::new(AtomicBool::new(false));
     let mut counted_target = CountingOutbound {
         inner: target,
         counters: stats,
         check_bt: block_bittorrent,
+        active: Arc::clone(&active),
     };
-    let _ = tokio::io::copy_bidirectional(client, &mut counted_target).await;
+    let mut tick = tokio::time::interval(conn_idle);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(client, &mut counted_target) => {}
+        _ = async {
+            loop {
+                tick.tick().await;
+                if !active.swap(false, Ordering::Relaxed) {
+                    break;
+                }
+            }
+        } => {}
+    }
     Ok(())
 }
 
@@ -114,6 +128,7 @@ struct CountingOutbound<'a> {
     inner: &'a mut TcpStream,
     counters: Option<Arc<UserTraffic>>,
     check_bt: bool,
+    active: Arc<AtomicBool>,
 }
 
 impl AsyncRead for CountingOutbound<'_> {
@@ -126,8 +141,11 @@ impl AsyncRead for CountingOutbound<'_> {
         let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &res {
             let delta = buf.filled().len().saturating_sub(before);
-            if let Some(c) = &self.counters {
-                c.add_downlink(delta as u64);
+            if delta > 0 {
+                self.active.store(true, Ordering::Relaxed);
+                if let Some(c) = &self.counters {
+                    c.add_downlink(delta as u64);
+                }
             }
         }
         res
@@ -151,8 +169,11 @@ impl AsyncWrite for CountingOutbound<'_> {
         }
         let res = Pin::new(&mut *self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &res {
-            if let Some(c) = &self.counters {
-                c.add_uplink(*n as u64);
+            if *n > 0 {
+                self.active.store(true, Ordering::Relaxed);
+                if let Some(c) = &self.counters {
+                    c.add_uplink(*n as u64);
+                }
             }
         }
         res
